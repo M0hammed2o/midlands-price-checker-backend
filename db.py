@@ -1,7 +1,9 @@
 from pathlib import Path
 import sqlite3
+import os
 
-DB_PATH = Path(__file__).parent / "midlands.db"
+DB_PATH = os.getenv("DB_PATH", "midlands.db")
+DB_URL = f"sqlite:///{DB_PATH}"
 
 def get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -94,4 +96,5 @@ def init_db() -> None:
     cur.execute("CREATE INDEX IF NOT EXISTS idx_bin_products_code ON bin_products(product_code);")
 
     conn.commit()
+
     conn.close()
