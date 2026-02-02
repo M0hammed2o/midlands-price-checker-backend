@@ -19,11 +19,13 @@ load_dotenv()
 
 app = FastAPI(title="Midlands Price Checker")
 
-# CORS (dev-friendly; tighten for production)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
+    allow_origins=[
+        "https://YOUR-FRONTEND-DOMAIN.com",
+        "http://localhost:5173"
+    ],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -406,4 +408,5 @@ def reorder(payload: dict = Body(...)):
 # Compatibility alias for old admin endpoint
 @app.post("/admin/reorder")
 def admin_reorder(payload: dict = Body(...)):
+
     return reorder(payload)
