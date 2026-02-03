@@ -96,6 +96,4 @@ def init_db() -> None:
     cur.execute("CREATE INDEX IF NOT EXISTS idx_bin_products_code ON bin_products(product_code);")
 
     conn.commit()
-
     conn.close()
-
