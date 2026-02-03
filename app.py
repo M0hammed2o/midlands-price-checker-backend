@@ -1,12 +1,20 @@
 import os
-import json
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Any, Dict
 
-from fastapi import FastAPI, Query, UploadFile, File, HTTPException, Body
+from fastapi import (
+    FastAPI,
+    Query,
+    UploadFile,
+    File,
+    HTTPException,
+    Body,
+    Header,
+    Depends,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from starlette.responses import FileResponse, JSONResponse
+from starlette.responses import FileResponse
 from dotenv import load_dotenv
 
 from db import init_db, get_conn
@@ -19,13 +27,30 @@ load_dotenv()
 
 app = FastAPI(title="Midlands Price Checker")
 
+# -----------------------------
+# Simple Admin PIN protection
+# -----------------------------
+ADMIN_PIN = os.getenv("ADMIN_PIN", "").strip()
+
+def require_admin_pin(x_admin_pin: Optional[str] = Header(default=None)):
+    """
+    Protect admin endpoints using a simple PIN header:
+      X-Admin-Pin: <PIN>
+
+    If ADMIN_PIN is not set in .env, we block admin routes (safe by default).
+    """
+    if not ADMIN_PIN:
+        raise HTTPException(status_code=500, detail="ADMIN_PIN is not configured on server")
+
+    if (x_admin_pin or "").strip() != ADMIN_PIN:
+        raise HTTPException(status_code=401, detail="Invalid admin PIN")
+
+
+# CORS (dev-friendly; tighten for production)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://YOUR-FRONTEND-DOMAIN.com",
-        "http://localhost:5173"
-    ],
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -39,13 +64,51 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 REPORT_CSV_PATH = os.path.join(DATA_DIR, "ProductScanApp_clean.csv")
 
-app.include_router(stocktake_router)
+
+# ✅ Protect ALL stocktake routes (as you requested)
+app.include_router(stocktake_router, dependencies=[Depends(require_admin_pin)])
+
+
+# -----------------------------
+# Bridge / Process Request tables
+# (your frontend calls /bridge/process_requests)
+# -----------------------------
+def init_bridge_tables():
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS process_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                requested_by TEXT
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS process_request_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id INTEGER NOT NULL,
+                product_code TEXT NOT NULL,
+                qty REAL NOT NULL,
+                description TEXT,
+                price REAL,
+                FOREIGN KEY(request_id) REFERENCES process_requests(id) ON DELETE CASCADE
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 @app.on_event("startup")
 def startup():
     init_db()
     init_stocktake_tables()
+    init_bridge_tables()
 
 
 @app.get("/health")
@@ -56,7 +119,7 @@ def health():
 # -----------------------------
 # Admin: Upload report CSV
 # -----------------------------
-@app.post("/admin/upload_report")
+@app.post("/admin/upload_report", dependencies=[Depends(require_admin_pin)])
 async def upload_report(file: UploadFile = File(...)):
     filename = (file.filename or "").lower()
     if not filename.endswith(".csv"):
@@ -88,19 +151,7 @@ class ProductOut(BaseModel):
     image_url: Optional[str] = None
 
 
-class ReorderLine(BaseModel):
-    product_code: str
-    qty: float = Field(..., gt=0)
-    note: Optional[str] = None
-
-
-class ReorderRequest(BaseModel):
-    requested_by: Optional[str] = None
-    lines: List[ReorderLine]
-
-
 def _image_path_for(code: str) -> str:
-    # we store as JPG consistently
     safe = (code or "").strip()
     return os.path.join(IMAGES_DIR, f"{safe}.jpg")
 
@@ -234,7 +285,6 @@ def get_product_image(product_code: str):
     if not os.path.exists(path):
         raise HTTPException(status_code=404, detail="Image not found")
 
-    # FileResponse sets correct headers for browser
     return FileResponse(path, media_type="image/jpeg")
 
 
@@ -242,14 +292,11 @@ def get_product_image(product_code: str):
 async def upload_product_image(product_code: str, file: UploadFile = File(...)):
     """
     Upload an image for a product. Stored as product_images/<product_code>.jpg
-    Accepts JPG/PNG/WEBP (we store whatever bytes as .jpg, so ideally upload jpg).
+    Accepts JPG/PNG/WEBP (we store bytes as .jpg, so ideally upload jpg).
     """
     code = (product_code or "").strip()
     if not code:
         raise HTTPException(status_code=400, detail="product_code required")
-
-    if not file:
-        raise HTTPException(status_code=400, detail="No file uploaded")
 
     filename = (file.filename or "").lower()
     if not (filename.endswith(".jpg") or filename.endswith(".jpeg") or filename.endswith(".png") or filename.endswith(".webp")):
@@ -286,21 +333,68 @@ def delete_product_image(product_code: str):
         raise HTTPException(status_code=500, detail=f"Failed to delete image: {repr(e)}")
 
 
-# Compatibility endpoints if your old frontend calls these:
-@app.post("/admin/upload_image")
+# Compatibility endpoints (if old frontend calls these)
+@app.post("/admin/upload_image", dependencies=[Depends(require_admin_pin)])
 async def admin_upload_image(product_code: str = Query(...), file: UploadFile = File(...)):
     return await upload_product_image(product_code=product_code, file=file)
 
 
-@app.delete("/admin/delete_image")
+@app.delete("/admin/delete_image", dependencies=[Depends(require_admin_pin)])
 def admin_delete_image(product_code: str = Query(...)):
     return delete_product_image(product_code=product_code)
 
 
 # -----------------------------
+# Bridge: Process Requests
+# -----------------------------
+class ProcessItemIn(BaseModel):
+    product_code: str
+    qty: float = Field(..., gt=0)
+    description: Optional[str] = None
+    price: Optional[float] = None
+
+
+class ProcessRequestIn(BaseModel):
+    requested_by: Optional[str] = None
+    items: List[ProcessItemIn]
+
+
+@app.post("/bridge/process_requests")
+def create_process_request(payload: ProcessRequestIn):
+    if not payload.items:
+        raise HTTPException(status_code=400, detail="No items provided")
+
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "INSERT INTO process_requests (created_at, requested_by) VALUES (?, ?)",
+            (datetime.now().isoformat(timespec="seconds"), (payload.requested_by or "").strip() or None),
+        )
+        request_id = cur.lastrowid
+
+        for it in payload.items:
+            code = (it.product_code or "").strip()
+            if not code:
+                continue
+            cur.execute(
+                """
+                INSERT INTO process_request_items
+                (request_id, product_code, qty, description, price)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (request_id, code, float(it.qty), it.description, it.price),
+            )
+
+        conn.commit()
+        return {"ok": True, "id": request_id}
+    finally:
+        conn.close()
+
+
+# -----------------------------
 # Reorder Email (simple + reliable)
 # -----------------------------
-
 @app.post("/reorder")
 def reorder(payload: dict = Body(...)):
     """
@@ -321,13 +415,12 @@ def reorder(payload: dict = Body(...)):
         or "Unknown"
     )
 
-    # ✅ Single-item payload support
+    # Single-item payload support
     if ("product_code" in payload or "productCode" in payload or "code" in payload) and (
         "qty" in payload or "quantity" in payload or "count" in payload
     ):
         raw_lines = [payload]
     else:
-        # Try common list keys first
         raw_lines = (
             payload.get("lines")
             or payload.get("items")
@@ -339,7 +432,6 @@ def reorder(payload: dict = Body(...)):
             or payload.get("data")
         )
 
-        # If still missing, try to locate ANY list value inside payload
         if raw_lines is None:
             for v in payload.values():
                 if isinstance(v, list):
@@ -349,7 +441,6 @@ def reorder(payload: dict = Body(...)):
         if raw_lines is None:
             raw_lines = []
 
-    # If a single line item is sent as an object, wrap it
     if isinstance(raw_lines, dict):
         raw_lines = [raw_lines]
 
@@ -408,5 +499,4 @@ def reorder(payload: dict = Body(...)):
 # Compatibility alias for old admin endpoint
 @app.post("/admin/reorder")
 def admin_reorder(payload: dict = Body(...)):
-
     return reorder(payload)
