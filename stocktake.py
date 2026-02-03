@@ -1,16 +1,29 @@
 # backend/stocktake.py
 import csv
 import io
+import os
 from datetime import datetime
 from typing import Optional
 
-from fastapi import APIRouter, UploadFile, File, HTTPException, Query, Body
+from fastapi import APIRouter, UploadFile, File, HTTPException, Query, Body, Header, Depends
 from starlette.responses import StreamingResponse
 
 from db import get_conn
 from bin_import import parse_bin_locations_csv
 
 router = APIRouter(prefix="/stocktake", tags=["stocktake"])
+
+
+# -----------------------------
+# Simple Admin PIN protection (same logic as app.py)
+# -----------------------------
+ADMIN_PIN = os.getenv("ADMIN_PIN", "").strip()
+
+def require_admin_pin(x_admin_pin: Optional[str] = Header(default=None)):
+    if not ADMIN_PIN:
+        raise HTTPException(status_code=500, detail="ADMIN_PIN is not configured on server")
+    if (x_admin_pin or "").strip() != ADMIN_PIN:
+        raise HTTPException(status_code=401, detail="Invalid admin PIN")
 
 
 def now_iso() -> str:
@@ -80,7 +93,6 @@ def list_bins():
         )
         bins = [r["bin_code"] for r in cur.fetchall()]
 
-        # Also include existing session_ids from stocktake_sessions (in case bins not uploaded)
         cur.execute(
             """
             SELECT session_id FROM stocktake_sessions
@@ -94,6 +106,7 @@ def list_bins():
         return merged
     finally:
         conn.close()
+
 
 @router.get("/bin_products")
 def get_bin_products(bin_code: str = Query(...)):
@@ -123,7 +136,8 @@ def get_bin_products(bin_code: str = Query(...)):
     finally:
         conn.close()
 
-@router.post("/bins/upload")
+
+@router.post("/bins/upload", dependencies=[Depends(require_admin_pin)])
 async def upload_bins(file: UploadFile = File(...)):
     filename = (file.filename or "").lower()
     if not filename.endswith(".csv"):
@@ -197,7 +211,7 @@ def _resolve_product(barcode: Optional[str], product_code: Optional[str]):
         conn.close()
 
 
-@router.post("/item")
+@router.post("/item", dependencies=[Depends(require_admin_pin)])
 def add_or_update_item(payload: dict = Body(...)):
     session_id = (payload.get("session_id") or "").strip()
     barcode = payload.get("barcode")
@@ -285,7 +299,7 @@ def list_items(session_id: str = Query(...)):
         conn.close()
 
 
-@router.delete("/items")
+@router.delete("/items", dependencies=[Depends(require_admin_pin)])
 def clear_items(session_id: str = Query(...)):
     session_id = (session_id or "").strip()
     conn = get_conn()
@@ -298,12 +312,8 @@ def clear_items(session_id: str = Query(...)):
         conn.close()
 
 
-@router.post("/move")
+@router.post("/move", dependencies=[Depends(require_admin_pin)])
 def move_item(payload: dict = Body(...)):
-    """
-    Move a product from one bin(session) to another.
-    Keeps qty/desc/barcode, updates timestamps.
-    """
     from_session_id = (payload.get("from_session_id") or "").strip()
     to_session_id = (payload.get("to_session_id") or "").strip()
     product_code = (payload.get("product_code") or "").strip()
@@ -327,7 +337,6 @@ def move_item(payload: dict = Body(...)):
         if not r:
             raise HTTPException(status_code=404, detail="Item not found in source bin")
 
-        # ensure destination session exists
         cur.execute(
             """
             INSERT OR IGNORE INTO stocktake_sessions (session_id, label, created_at)
@@ -336,7 +345,6 @@ def move_item(payload: dict = Body(...)):
             (to_session_id, to_session_id, now_iso()),
         )
 
-        # upsert into destination
         cur.execute(
             """
             INSERT INTO stocktake_items
@@ -361,7 +369,6 @@ def move_item(payload: dict = Body(...)):
             ),
         )
 
-        # delete from source
         cur.execute(
             "DELETE FROM stocktake_items WHERE session_id = ? AND product_code = ?",
             (from_session_id, product_code),
@@ -371,7 +378,6 @@ def move_item(payload: dict = Body(...)):
         return {"ok": True}
     finally:
         conn.close()
-
 
 @router.get("/export")
 def export_session(session_id: str = Query(...)):
