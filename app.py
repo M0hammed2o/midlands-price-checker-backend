@@ -1,6 +1,6 @@
 import os
 from datetime import datetime
-from typing import List, Optional, Any, Dict
+from typing import List, Optional
 
 from fastapi import (
     FastAPI,
@@ -11,16 +11,16 @@ from fastapi import (
     Body,
     Header,
     Depends,
+    Request,
 )
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from starlette.responses import FileResponse
+from starlette.responses import FileResponse, JSONResponse
 from dotenv import load_dotenv
 
 from db import init_db, get_conn
 from import_csv import import_products
 from emailer import send_reorder_email
-
 from stocktake import router as stocktake_router, init_stocktake_tables
 
 load_dotenv()
@@ -28,24 +28,12 @@ load_dotenv()
 app = FastAPI(title="Midlands Price Checker")
 
 # -----------------------------
-# Simple Admin PIN protection
+# CORS
 # -----------------------------
-ADMIN_PIN = os.getenv("ADMIN_PIN", "").strip()
-
-def require_admin_pin(x_admin_pin: Optional[str] = Header(default=None)):
-    """
-    Protect admin endpoints using a simple PIN header:
-      X-Admin-Pin: <PIN>
-
-    If ADMIN_PIN is not set in .env, we block admin routes (safe by default).
-    """
-    if not ADMIN_PIN:
-        raise HTTPException(status_code=500, detail="ADMIN_PIN is not configured on server")
-
-    if (x_admin_pin or "").strip() != ADMIN_PIN:
-        raise HTTPException(status_code=401, detail="Invalid admin PIN")
-
-
+# IMPORTANT:
+# - Must allow your Pages.dev domain
+# - Must allow X-Admin-Pin header
+# - Must handle OPTIONS preflight cleanly
 ALLOWED_ORIGINS = [
     "https://midlands-price-checker.pages.dev",
     "http://localhost:5173",
@@ -56,11 +44,39 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],  # important so X-Admin-Pin is allowed
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["*"],  # includes X-Admin-Pin
+    max_age=86400,
 )
 
+# -----------------------------
+# Simple Admin PIN protection
+# -----------------------------
+def _get_admin_pin() -> str:
+    # Read fresh each request so Render env changes take effect immediately
+    return (os.getenv("ADMIN_PIN", "") or "").strip()
+
+
+def require_admin_pin(x_admin_pin: Optional[str] = Header(default=None)):
+    """
+    Protect admin endpoints using a simple PIN header:
+      X-Admin-Pin: <PIN>
+
+    If ADMIN_PIN is not set in env, admin routes are blocked (safe by default).
+    """
+    admin_pin = _get_admin_pin()
+    if not admin_pin:
+        raise HTTPException(status_code=500, detail="ADMIN_PIN is not configured on server")
+
+    if (x_admin_pin or "").strip() != admin_pin:
+        raise HTTPException(status_code=401, detail="Invalid admin PIN")
+
+
+# -----------------------------
+# Paths / storage
+# -----------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 IMAGES_DIR = os.path.join(BASE_DIR, "product_images")
 os.makedirs(IMAGES_DIR, exist_ok=True)
 
@@ -70,13 +86,12 @@ os.makedirs(DATA_DIR, exist_ok=True)
 REPORT_CSV_PATH = os.path.join(DATA_DIR, "ProductScanApp_clean.csv")
 
 
-# ✅ Protect ALL stocktake routes (as you requested)
+# ✅ Protect ALL stocktake routes
 app.include_router(stocktake_router, dependencies=[Depends(require_admin_pin)])
 
 
 # -----------------------------
 # Bridge / Process Request tables
-# (your frontend calls /bridge/process_requests)
 # -----------------------------
 def init_bridge_tables():
     conn = get_conn()
@@ -121,8 +136,18 @@ def health():
     return {"ok": True}
 
 
+# Optional: quick server-side check that requests arrive with correct origin/header
+@app.get("/debug/cors")
+def debug_cors(request: Request, x_admin_pin: Optional[str] = Header(default=None)):
+    return {
+        "origin": request.headers.get("origin"),
+        "has_pin_header": bool((x_admin_pin or "").strip()),
+        "allowed_origins": ALLOWED_ORIGINS,
+    }
+
+
 # -----------------------------
-# Admin: Upload report CSV
+# Admin: Upload report CSV (PIN required)
 # -----------------------------
 @app.post("/admin/upload_report", dependencies=[Depends(require_admin_pin)])
 async def upload_report(file: UploadFile = File(...)):
@@ -173,8 +198,8 @@ def _rows_to_products(rows) -> List[ProductOut]:
                 product_code=code,
                 full_description=r["full_description"],
                 retail_price=float(r["retail_price"]),
-                manufacturers_product_code=r["manufacturers_product_code"],
-                barcode=r["barcode"],
+                manufacturers_product_code=r.get("manufacturers_product_code"),
+                barcode=r.get("barcode"),
                 image_url=image_url,
             )
         )
@@ -265,9 +290,7 @@ def search_products(
     return _search_products_internal(q=effective_q, mode=mode, limit=limit)
 
 
-# -----------------------------
 # Compatibility: old frontend endpoint
-# -----------------------------
 @app.get("/search", response_model=List[ProductOut])
 def legacy_search(
     q: str = Query("", min_length=0),
@@ -279,6 +302,7 @@ def legacy_search(
 
 # -----------------------------
 # Product Images (serve / upload / delete)
+# IMPORTANT: upload/delete should require PIN (your frontend sends it)
 # -----------------------------
 @app.get("/products/{product_code}/image")
 def get_product_image(product_code: str):
@@ -293,11 +317,11 @@ def get_product_image(product_code: str):
     return FileResponse(path, media_type="image/jpeg")
 
 
-@app.post("/products/{product_code}/image")
+@app.post("/products/{product_code}/image", dependencies=[Depends(require_admin_pin)])
 async def upload_product_image(product_code: str, file: UploadFile = File(...)):
     """
     Upload an image for a product. Stored as product_images/<product_code>.jpg
-    Accepts JPG/PNG/WEBP (we store bytes as .jpg, so ideally upload jpg).
+    Accepts JPG/PNG/WEBP (stored as .jpg bytes).
     """
     code = (product_code or "").strip()
     if not code:
@@ -321,7 +345,7 @@ async def upload_product_image(product_code: str, file: UploadFile = File(...)):
     return {"ok": True, "product_code": code, "image_url": f"/products/{code}/image"}
 
 
-@app.delete("/products/{product_code}/image")
+@app.delete("/products/{product_code}/image", dependencies=[Depends(require_admin_pin)])
 def delete_product_image(product_code: str):
     code = (product_code or "").strip()
     if not code:
@@ -404,19 +428,12 @@ def create_process_request(payload: ProcessRequestIn):
 def reorder(payload: dict = Body(...)):
     """
     Accepts flexible payload shapes to avoid 422s.
-
-    Supported examples:
-      1) { "requested_by": "...", "lines": [ {"product_code":"107", "qty":5, "note":"..."} ] }
-      2) { "requested_by": "...", "items": [ {"product_code":"107", "quantity":5} ] }
-      3) { "updated_by": "...", "cart": [ {"code":"107", "qty":5} ] }
-      4) { "product_code":"107", "qty":5 }   # single item
     """
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Invalid JSON payload (expected object)")
 
     requested_by = (
-        (payload.get("requested_by") or payload.get("updated_by") or payload.get("user") or "")
-        .strip()
+        (payload.get("requested_by") or payload.get("updated_by") or payload.get("user") or "").strip()
         or "Unknown"
     )
 
@@ -436,13 +453,11 @@ def reorder(payload: dict = Body(...)):
             or payload.get("reorder_items")
             or payload.get("data")
         )
-
         if raw_lines is None:
             for v in payload.values():
                 if isinstance(v, list):
                     raw_lines = v
                     break
-
         if raw_lines is None:
             raw_lines = []
 
@@ -505,4 +520,3 @@ def reorder(payload: dict = Body(...)):
 @app.post("/admin/reorder")
 def admin_reorder(payload: dict = Body(...)):
     return reorder(payload)
-
