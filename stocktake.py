@@ -19,7 +19,7 @@ router = APIRouter(prefix="/stocktake", tags=["stocktake"])
 # FIX: do NOT cache ADMIN_PIN at import-time
 # -----------------------------
 def require_admin_pin(x_admin_pin: Optional[str] = Header(default=None)):
-    admin_pin = (os.getenv("ADMIN_PIN", "") or "").strip()  # <-- read dynamically
+    admin_pin = (os.getenv("ADMIN_PIN", "") or "").strip()  # read dynamically
     if not admin_pin:
         raise HTTPException(status_code=500, detail="ADMIN_PIN is not configured on server")
     if (x_admin_pin or "").strip() != admin_pin:
@@ -181,6 +181,15 @@ async def upload_bins(file: UploadFile = File(...)):
         conn.close()
 
 
+def _row_barcode(r) -> Optional[str]:
+    # sqlite3.Row doesn't support .get()
+    try:
+        keys = r.keys()
+    except Exception:
+        keys = []
+    return r["barcode"] if "barcode" in keys else None
+
+
 def _resolve_product(barcode: Optional[str], product_code: Optional[str]):
     barcode = (barcode or "").strip().replace(" ", "")
     product_code = (product_code or "").strip()
@@ -192,19 +201,19 @@ def _resolve_product(barcode: Optional[str], product_code: Optional[str]):
             cur.execute("SELECT * FROM products WHERE barcode = ? LIMIT 1", (barcode,))
             r = cur.fetchone()
             if r:
-                return r["product_code"], r["full_description"], r.get("barcode")
+                return r["product_code"], r["full_description"], _row_barcode(r)
 
         if product_code:
             cur.execute("SELECT * FROM products WHERE product_code = ? LIMIT 1", (product_code,))
             r = cur.fetchone()
             if r:
-                return r["product_code"], r["full_description"], r.get("barcode")
+                return r["product_code"], r["full_description"], _row_barcode(r)
 
         if barcode.isdigit():
             cur.execute("SELECT * FROM products WHERE product_code = ? LIMIT 1", (barcode,))
             r = cur.fetchone()
             if r:
-                return r["product_code"], r["full_description"], r.get("barcode")
+                return r["product_code"], r["full_description"], _row_barcode(r)
 
         return (product_code or barcode or ""), "UNKNOWN", (barcode or None)
     finally:
