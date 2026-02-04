@@ -15,14 +15,37 @@ router = APIRouter(prefix="/stocktake", tags=["stocktake"])
 
 
 # -----------------------------
-# Simple Admin PIN protection
-# FIX: do NOT cache ADMIN_PIN at import-time
+# Admin PIN protection
+# - Header: X-Admin-Pin
+# - (Export only): query param admin_pin or pin
 # -----------------------------
-def require_admin_pin(x_admin_pin: Optional[str] = Header(default=None)):
-    admin_pin = (os.getenv("ADMIN_PIN", "") or "").strip()  # read dynamically
+def _read_admin_pin_env() -> str:
+    return (os.getenv("ADMIN_PIN", "") or "").strip()
+
+
+def require_admin_pin_header(x_admin_pin: Optional[str] = Header(default=None)):
+    admin_pin = _read_admin_pin_env()
     if not admin_pin:
         raise HTTPException(status_code=500, detail="ADMIN_PIN is not configured on server")
     if (x_admin_pin or "").strip() != admin_pin:
+        raise HTTPException(status_code=401, detail="Invalid admin PIN")
+
+
+def require_admin_pin_header_or_query(
+    x_admin_pin: Optional[str] = Header(default=None),
+    admin_pin: Optional[str] = Query(default=None),
+    pin: Optional[str] = Query(default=None),
+):
+    """
+    Used for endpoints that might be opened as a direct download link in the browser.
+    Browser can't send custom headers reliably, so we accept ?admin_pin= or ?pin= too.
+    """
+    server_pin = _read_admin_pin_env()
+    if not server_pin:
+        raise HTTPException(status_code=500, detail="ADMIN_PIN is not configured on server")
+
+    provided = (x_admin_pin or "").strip() or (admin_pin or "").strip() or (pin or "").strip()
+    if provided != server_pin:
         raise HTTPException(status_code=401, detail="Invalid admin PIN")
 
 
@@ -78,7 +101,7 @@ def init_stocktake_tables():
         conn.close()
 
 
-@router.get("/bins", dependencies=[Depends(require_admin_pin)])
+@router.get("/bins", dependencies=[Depends(require_admin_pin_header)])
 def list_bins():
     conn = get_conn()
     cur = conn.cursor()
@@ -102,13 +125,12 @@ def list_bins():
         )
         sessions = [r["session_id"] for r in cur.fetchall()]
 
-        merged = sorted(set(bins + sessions))
-        return merged
+        return sorted(set(bins + sessions))
     finally:
         conn.close()
 
 
-@router.get("/bin_products", dependencies=[Depends(require_admin_pin)])
+@router.get("/bin_products", dependencies=[Depends(require_admin_pin_header)])
 def get_bin_products(bin_code: str = Query(...)):
     bin_code = (bin_code or "").strip()
     if not bin_code:
@@ -137,7 +159,7 @@ def get_bin_products(bin_code: str = Query(...)):
         conn.close()
 
 
-@router.post("/bins/upload", dependencies=[Depends(require_admin_pin)])
+@router.post("/bins/upload", dependencies=[Depends(require_admin_pin_header)])
 async def upload_bins(file: UploadFile = File(...)):
     filename = (file.filename or "").lower()
     if not filename.endswith(".csv"):
@@ -181,15 +203,6 @@ async def upload_bins(file: UploadFile = File(...)):
         conn.close()
 
 
-def _row_barcode(r) -> Optional[str]:
-    # sqlite3.Row doesn't support .get()
-    try:
-        keys = r.keys()
-    except Exception:
-        keys = []
-    return r["barcode"] if "barcode" in keys else None
-
-
 def _resolve_product(barcode: Optional[str], product_code: Optional[str]):
     barcode = (barcode or "").strip().replace(" ", "")
     product_code = (product_code or "").strip()
@@ -201,26 +214,30 @@ def _resolve_product(barcode: Optional[str], product_code: Optional[str]):
             cur.execute("SELECT * FROM products WHERE barcode = ? LIMIT 1", (barcode,))
             r = cur.fetchone()
             if r:
-                return r["product_code"], r["full_description"], _row_barcode(r)
+                # sqlite3.Row has no .get()
+                rb = r["barcode"] if "barcode" in r.keys() else None
+                return r["product_code"], r["full_description"], rb
 
         if product_code:
             cur.execute("SELECT * FROM products WHERE product_code = ? LIMIT 1", (product_code,))
             r = cur.fetchone()
             if r:
-                return r["product_code"], r["full_description"], _row_barcode(r)
+                rb = r["barcode"] if "barcode" in r.keys() else None
+                return r["product_code"], r["full_description"], rb
 
         if barcode.isdigit():
             cur.execute("SELECT * FROM products WHERE product_code = ? LIMIT 1", (barcode,))
             r = cur.fetchone()
             if r:
-                return r["product_code"], r["full_description"], _row_barcode(r)
+                rb = r["barcode"] if "barcode" in r.keys() else None
+                return r["product_code"], r["full_description"], rb
 
         return (product_code or barcode or ""), "UNKNOWN", (barcode or None)
     finally:
         conn.close()
 
 
-@router.post("/item", dependencies=[Depends(require_admin_pin)])
+@router.post("/item", dependencies=[Depends(require_admin_pin_header)])
 def add_or_update_item(payload: dict = Body(...)):
     session_id = (payload.get("session_id") or "").strip()
     barcode = payload.get("barcode")
@@ -288,7 +305,7 @@ def add_or_update_item(payload: dict = Body(...)):
         conn.close()
 
 
-@router.get("/items", dependencies=[Depends(require_admin_pin)])
+@router.get("/items", dependencies=[Depends(require_admin_pin_header)])
 def list_items(session_id: str = Query(...)):
     session_id = (session_id or "").strip()
     conn = get_conn()
@@ -308,7 +325,7 @@ def list_items(session_id: str = Query(...)):
         conn.close()
 
 
-@router.delete("/items", dependencies=[Depends(require_admin_pin)])
+@router.delete("/items", dependencies=[Depends(require_admin_pin_header)])
 def clear_items(session_id: str = Query(...)):
     session_id = (session_id or "").strip()
     conn = get_conn()
@@ -321,7 +338,7 @@ def clear_items(session_id: str = Query(...)):
         conn.close()
 
 
-@router.post("/move", dependencies=[Depends(require_admin_pin)])
+@router.post("/move", dependencies=[Depends(require_admin_pin_header)])
 def move_item(payload: dict = Body(...)):
     from_session_id = (payload.get("from_session_id") or "").strip()
     to_session_id = (payload.get("to_session_id") or "").strip()
@@ -389,7 +406,10 @@ def move_item(payload: dict = Body(...)):
         conn.close()
 
 
-@router.get("/export", dependencies=[Depends(require_admin_pin)])
+# -----------------------------
+# EXPORTS (allow header OR query pin)
+# -----------------------------
+@router.get("/export", dependencies=[Depends(require_admin_pin_header_or_query)])
 def export_session(session_id: str = Query(...)):
     session_id = (session_id or "").strip()
     conn = get_conn()
@@ -430,7 +450,7 @@ def export_session(session_id: str = Query(...)):
         conn.close()
 
 
-@router.get("/export_all_bins", dependencies=[Depends(require_admin_pin)])
+@router.get("/export_all_bins", dependencies=[Depends(require_admin_pin_header_or_query)])
 def export_all_bins():
     conn = get_conn()
     cur = conn.cursor()
@@ -468,7 +488,7 @@ def export_all_bins():
         conn.close()
 
 
-@router.get("/export_all_merged", dependencies=[Depends(require_admin_pin)])
+@router.get("/export_all_merged", dependencies=[Depends(require_admin_pin_header_or_query)])
 def export_all_merged():
     conn = get_conn()
     cur = conn.cursor()
