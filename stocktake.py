@@ -15,14 +15,14 @@ router = APIRouter(prefix="/stocktake", tags=["stocktake"])
 
 
 # -----------------------------
-# Simple Admin PIN protection (same logic as app.py)
+# Simple Admin PIN protection
+# FIX: do NOT cache ADMIN_PIN at import-time
 # -----------------------------
-ADMIN_PIN = os.getenv("ADMIN_PIN", "").strip()
-
 def require_admin_pin(x_admin_pin: Optional[str] = Header(default=None)):
-    if not ADMIN_PIN:
+    admin_pin = (os.getenv("ADMIN_PIN", "") or "").strip()  # <-- read dynamically
+    if not admin_pin:
         raise HTTPException(status_code=500, detail="ADMIN_PIN is not configured on server")
-    if (x_admin_pin or "").strip() != ADMIN_PIN:
+    if (x_admin_pin or "").strip() != admin_pin:
         raise HTTPException(status_code=401, detail="Invalid admin PIN")
 
 
@@ -78,7 +78,7 @@ def init_stocktake_tables():
         conn.close()
 
 
-@router.get("/bins")
+@router.get("/bins", dependencies=[Depends(require_admin_pin)])
 def list_bins():
     conn = get_conn()
     cur = conn.cursor()
@@ -108,7 +108,7 @@ def list_bins():
         conn.close()
 
 
-@router.get("/bin_products")
+@router.get("/bin_products", dependencies=[Depends(require_admin_pin)])
 def get_bin_products(bin_code: str = Query(...)):
     bin_code = (bin_code or "").strip()
     if not bin_code:
@@ -220,7 +220,7 @@ def add_or_update_item(payload: dict = Body(...)):
 
     try:
         quantity = float(payload.get("quantity") or 0)
-    except:
+    except Exception:
         quantity = 0.0
 
     if not session_id:
@@ -279,7 +279,7 @@ def add_or_update_item(payload: dict = Body(...)):
         conn.close()
 
 
-@router.get("/items")
+@router.get("/items", dependencies=[Depends(require_admin_pin)])
 def list_items(session_id: str = Query(...)):
     session_id = (session_id or "").strip()
     conn = get_conn()
@@ -379,12 +379,9 @@ def move_item(payload: dict = Body(...)):
     finally:
         conn.close()
 
-@router.get("/export")
+
+@router.get("/export", dependencies=[Depends(require_admin_pin)])
 def export_session(session_id: str = Query(...)):
-    """
-    Export ONE bin/session.
-    Includes 'bin' column because Kerridge wants it even for individual sessions.
-    """
     session_id = (session_id or "").strip()
     conn = get_conn()
     cur = conn.cursor()
@@ -424,12 +421,8 @@ def export_session(session_id: str = Query(...)):
         conn.close()
 
 
-@router.get("/export_all_bins")
+@router.get("/export_all_bins", dependencies=[Depends(require_admin_pin)])
 def export_all_bins():
-    """
-    Export ALL bins in ONE file.
-    Sorted by bin then product_code (Kerridge-friendly).
-    """
     conn = get_conn()
     cur = conn.cursor()
     try:
@@ -466,12 +459,8 @@ def export_all_bins():
         conn.close()
 
 
-@router.get("/export_all_merged")
+@router.get("/export_all_merged", dependencies=[Depends(require_admin_pin)])
 def export_all_merged():
-    """
-    Export ALL bins merged into totals per product_code.
-    (No bin column — this is a grand total report.)
-    """
     conn = get_conn()
     cur = conn.cursor()
     try:
