@@ -1,6 +1,6 @@
 import os
 from datetime import datetime
-from typing import List, Optional, Any, Dict
+from typing import List, Optional
 
 from fastapi import (
     FastAPI,
@@ -36,8 +36,6 @@ def require_admin_pin(x_admin_pin: Optional[str] = Header(default=None)):
     """
     Protect admin endpoints using a simple PIN header:
       X-Admin-Pin: <PIN>
-
-    If ADMIN_PIN is not set in .env, we block admin routes (safe by default).
     """
     if not ADMIN_PIN:
         raise HTTPException(status_code=500, detail="ADMIN_PIN is not configured on server")
@@ -46,6 +44,9 @@ def require_admin_pin(x_admin_pin: Optional[str] = Header(default=None)):
         raise HTTPException(status_code=401, detail="Invalid admin PIN")
 
 
+# -----------------------------
+# CORS (FIXED FOR X-Admin-Pin preflight)
+# -----------------------------
 ALLOWED_ORIGINS = [
     "https://midlands-price-checker.pages.dev",
     "http://localhost:5173",
@@ -56,8 +57,9 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],  # important so X-Admin-Pin is allowed
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    # IMPORTANT: explicitly allow your custom header so preflight succeeds
+    allow_headers=["Content-Type", "X-Admin-Pin", "Authorization"],
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -69,14 +71,13 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 REPORT_CSV_PATH = os.path.join(DATA_DIR, "ProductScanApp_clean.csv")
 
-
-# ✅ Protect ALL stocktake routes (as you requested)
-app.include_router(stocktake_router, dependencies=[Depends(require_admin_pin)])
+# ✅ DO NOT protect the entire router at include_router level.
+# Stocktake endpoints that need PIN already have dependencies in stocktake.py.
+app.include_router(stocktake_router)
 
 
 # -----------------------------
 # Bridge / Process Request tables
-# (your frontend calls /bridge/process_requests)
 # -----------------------------
 def init_bridge_tables():
     conn = get_conn()
@@ -265,9 +266,6 @@ def search_products(
     return _search_products_internal(q=effective_q, mode=mode, limit=limit)
 
 
-# -----------------------------
-# Compatibility: old frontend endpoint
-# -----------------------------
 @app.get("/search", response_model=List[ProductOut])
 def legacy_search(
     q: str = Query("", min_length=0),
@@ -278,7 +276,7 @@ def legacy_search(
 
 
 # -----------------------------
-# Product Images (serve / upload / delete)
+# Product Images
 # -----------------------------
 @app.get("/products/{product_code}/image")
 def get_product_image(product_code: str):
@@ -293,12 +291,8 @@ def get_product_image(product_code: str):
     return FileResponse(path, media_type="image/jpeg")
 
 
-@app.post("/products/{product_code}/image")
+@app.post("/products/{product_code}/image", dependencies=[Depends(require_admin_pin)])
 async def upload_product_image(product_code: str, file: UploadFile = File(...)):
-    """
-    Upload an image for a product. Stored as product_images/<product_code>.jpg
-    Accepts JPG/PNG/WEBP (we store bytes as .jpg, so ideally upload jpg).
-    """
     code = (product_code or "").strip()
     if not code:
         raise HTTPException(status_code=400, detail="product_code required")
@@ -321,7 +315,7 @@ async def upload_product_image(product_code: str, file: UploadFile = File(...)):
     return {"ok": True, "product_code": code, "image_url": f"/products/{code}/image"}
 
 
-@app.delete("/products/{product_code}/image")
+@app.delete("/products/{product_code}/image", dependencies=[Depends(require_admin_pin)])
 def delete_product_image(product_code: str):
     code = (product_code or "").strip()
     if not code:
@@ -336,17 +330,6 @@ def delete_product_image(product_code: str):
         return {"ok": True, "deleted": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to delete image: {repr(e)}")
-
-
-# Compatibility endpoints (if old frontend calls these)
-@app.post("/admin/upload_image", dependencies=[Depends(require_admin_pin)])
-async def admin_upload_image(product_code: str = Query(...), file: UploadFile = File(...)):
-    return await upload_product_image(product_code=product_code, file=file)
-
-
-@app.delete("/admin/delete_image", dependencies=[Depends(require_admin_pin)])
-def admin_delete_image(product_code: str = Query(...)):
-    return delete_product_image(product_code=product_code)
 
 
 # -----------------------------
@@ -398,19 +381,10 @@ def create_process_request(payload: ProcessRequestIn):
 
 
 # -----------------------------
-# Reorder Email (simple + reliable)
+# Reorder Email
 # -----------------------------
 @app.post("/reorder")
 def reorder(payload: dict = Body(...)):
-    """
-    Accepts flexible payload shapes to avoid 422s.
-
-    Supported examples:
-      1) { "requested_by": "...", "lines": [ {"product_code":"107", "qty":5, "note":"..."} ] }
-      2) { "requested_by": "...", "items": [ {"product_code":"107", "quantity":5} ] }
-      3) { "updated_by": "...", "cart": [ {"code":"107", "qty":5} ] }
-      4) { "product_code":"107", "qty":5 }   # single item
-    """
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Invalid JSON payload (expected object)")
 
@@ -420,7 +394,6 @@ def reorder(payload: dict = Body(...)):
         or "Unknown"
     )
 
-    # Single-item payload support
     if ("product_code" in payload or "productCode" in payload or "code" in payload) and (
         "qty" in payload or "quantity" in payload or "count" in payload
     ):
@@ -501,7 +474,6 @@ def reorder(payload: dict = Body(...)):
         raise HTTPException(status_code=500, detail=f"Reorder email failed: {repr(e)}")
 
 
-# Compatibility alias for old admin endpoint
 @app.post("/admin/reorder")
 def admin_reorder(payload: dict = Body(...)):
     return reorder(payload)
