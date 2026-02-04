@@ -46,13 +46,18 @@ def require_admin_pin(x_admin_pin: Optional[str] = Header(default=None)):
         raise HTTPException(status_code=401, detail="Invalid admin PIN")
 
 
-# CORS (dev-friendly; tighten for production)
+ALLOWED_ORIGINS = [
+    "https://midlands-price-checker.pages.dev",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=False,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*"],  # important so X-Admin-Pin is allowed
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -500,3 +505,4 @@ def reorder(payload: dict = Body(...)):
 @app.post("/admin/reorder")
 def admin_reorder(payload: dict = Body(...)):
     return reorder(payload)
+
