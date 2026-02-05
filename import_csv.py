@@ -1,7 +1,11 @@
+# import_csv.py
 import csv
+import re
 from typing import Optional, List, Dict
+from datetime import datetime
 
 from db import get_conn
+
 
 def _pick(row: dict, *keys: str) -> Optional[str]:
     for k in keys:
@@ -12,6 +16,7 @@ def _pick(row: dict, *keys: str) -> Optional[str]:
         if s:
             return s
     return None
+
 
 def _to_float(value: Optional[str]) -> float:
     if value is None:
@@ -25,6 +30,7 @@ def _to_float(value: Optional[str]) -> float:
     except Exception:
         return 0.0
 
+
 def _read_csv_rows(csv_path: str) -> List[Dict[str, str]]:
     with open(csv_path, "rb") as f:
         raw = f.read()
@@ -35,11 +41,42 @@ def _read_csv_rows(csv_path: str) -> List[Dict[str, str]]:
             break
         except UnicodeDecodeError:
             text = None
+
     if text is None:
         text = raw.decode("latin-1", errors="replace")
 
     reader = csv.DictReader(text.splitlines())
     return list(reader)
+
+
+def _normalize_barcode(raw: Optional[str]) -> Optional[str]:
+    """
+    Normalize barcodes from CSV:
+    - removes leading ^ and whitespace
+    - keeps leading zeros
+    - strips non-digits
+    - returns None if empty or all zeros
+    """
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+
+    # Some exports prefix with ^
+    s = s.lstrip("^").strip()
+
+    # Keep digits only (EAN/UPC)
+    digits = re.sub(r"\D+", "", s)
+    if not digits:
+        return None
+
+    # Treat "000000..." as not a real barcode
+    if set(digits) == {"0"}:
+        return None
+
+    return digits
+
 
 def import_products(csv_path: str) -> int:
     rows = _read_csv_rows(csv_path)
@@ -48,6 +85,7 @@ def import_products(csv_path: str) -> int:
 
     conn = get_conn()
     cur = conn.cursor()
+    now = datetime.now().isoformat(timespec="seconds")
 
     inserted_or_updated = 0
     try:
@@ -55,30 +93,55 @@ def import_products(csv_path: str) -> int:
             product_code = _pick(row, "product_code", "Product Code", "Code")
             full_description = _pick(row, "full_description", "Full Description", "Description", "Name")
             retail_price = _to_float(_pick(row, "retail_price", "Retail Price", "VAT Inclusive Price", "Price"))
-
             mfg_code = _pick(row, "manufacturers_product_code", "Manufacturers Product Code", "Manufacturer Code")
 
-            # barcode from CSV (if any)
-            barcode = _pick(row, "barcode", "Barcode", "ScanCode", "scancode", "scan_code")
-            if barcode is not None:
-                barcode = barcode.strip().replace(" ", "")  # normalize
+            # ✅ IMPORTANT: your file uses "Bar Code"
+            barcode_raw = _pick(
+                row,
+                "barcode", "Barcode", "Bar Code", "BarCode", "BAR CODE", "BARCODE",
+                "ScanCode", "scancode", "scan_code", "Scan Code"
+            )
+            barcode = _normalize_barcode(barcode_raw)
 
             if not product_code or not full_description:
                 continue
 
+            # ✅ IMPORTANT: do NOT overwrite barcode with NULL if CSV barcode is empty
             cur.execute(
                 """
                 INSERT INTO products (product_code, full_description, retail_price, manufacturers_product_code, barcode)
                 VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(product_code) DO UPDATE SET
-                    full_description = excluded.full_description,
-                    retail_price = excluded.retail_price,
-                    manufacturers_product_code = excluded.manufacturers_product_code,
-                    -- ✅ DO NOT wipe barcode if excluded.barcode is NULL
-                    barcode = COALESCE(excluded.barcode, products.barcode)
+                    full_description=excluded.full_description,
+                    retail_price=excluded.retail_price,
+                    manufacturers_product_code=excluded.manufacturers_product_code,
+                    barcode = CASE
+                        WHEN excluded.barcode IS NULL OR TRIM(excluded.barcode) = ''
+                        THEN products.barcode
+                        ELSE excluded.barcode
+                    END
                 """,
                 (product_code, full_description, float(retail_price), mfg_code, barcode),
             )
+
+            # OPTIONAL: only write aliases if the table exists
+            # (prevents crash if you don't have barcode_aliases yet)
+            if barcode:
+                try:
+                    cur.execute(
+                        """
+                        INSERT INTO barcode_aliases (barcode, product_code, updated_at)
+                        VALUES (?, ?, ?)
+                        ON CONFLICT(barcode) DO UPDATE SET
+                            product_code=excluded.product_code,
+                            updated_at=excluded.updated_at
+                        """,
+                        (barcode, product_code, now),
+                    )
+                except Exception:
+                    # ignore if table doesn't exist
+                    pass
+
             inserted_or_updated += 1
 
         conn.commit()
