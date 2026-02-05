@@ -1,5 +1,5 @@
+# app.py
 import os
-import re
 from datetime import datetime
 from typing import List, Optional
 
@@ -29,17 +29,6 @@ load_dotenv()
 app = FastAPI(title="Midlands Price Checker")
 
 # -----------------------------
-# Simple Admin PIN protection (kept for upload_report + images only)
-# -----------------------------
-ADMIN_PIN = os.getenv("ADMIN_PIN", "").strip()
-
-def require_admin_pin(x_admin_pin: Optional[str] = Header(default=None)):
-    if not ADMIN_PIN:
-        raise HTTPException(status_code=500, detail="ADMIN_PIN is not configured on server")
-    if (x_admin_pin or "").strip() != ADMIN_PIN:
-        raise HTTPException(status_code=401, detail="Invalid admin PIN")
-
-# -----------------------------
 # CORS
 # -----------------------------
 ALLOWED_ORIGINS = [
@@ -53,7 +42,7 @@ app.add_middleware(
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=False,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type", "X-Admin-Pin", "Authorization"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -65,7 +54,9 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 REPORT_CSV_PATH = os.path.join(DATA_DIR, "ProductScanApp_clean.csv")
 
+# Stocktake routes
 app.include_router(stocktake_router)
+
 
 # -----------------------------
 # Bridge / Process Request tables
@@ -100,20 +91,23 @@ def init_bridge_tables():
     finally:
         conn.close()
 
+
 @app.on_event("startup")
 def startup():
     init_db()
     init_stocktake_tables()
     init_bridge_tables()
 
+
 @app.get("/health")
 def health():
     return {"ok": True}
 
+
 # -----------------------------
-# Admin: Upload report CSV
+# Upload report CSV (NO PIN)
 # -----------------------------
-@app.post("/admin/upload_report", dependencies=[Depends(require_admin_pin)])
+@app.post("/admin/upload_report")
 async def upload_report(file: UploadFile = File(...)):
     filename = (file.filename or "").lower()
     if not filename.endswith(".csv"):
@@ -132,6 +126,7 @@ async def upload_report(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"CSV import failed: {repr(e)}")
 
+
 # -----------------------------
 # Models
 # -----------------------------
@@ -143,26 +138,11 @@ class ProductOut(BaseModel):
     barcode: Optional[str] = None
     image_url: Optional[str] = None
 
-class BarcodeUpdateIn(BaseModel):
-    barcode: Optional[str] = None  # allow null to clear via PUT if you want
 
 def _image_path_for(code: str) -> str:
     safe = (code or "").strip()
     return os.path.join(IMAGES_DIR, f"{safe}.jpg")
 
-def _normalize_barcode(raw: Optional[str]) -> Optional[str]:
-    if raw is None:
-        return None
-    s = str(raw).strip()
-    if not s:
-        return None
-    s = s.lstrip("^").strip()
-    digits = re.sub(r"\D+", "", s)
-    if not digits:
-        return None
-    if set(digits) == {"0"}:
-        return None
-    return digits
 
 def _rows_to_products(rows) -> List[ProductOut]:
     out: List[ProductOut] = []
@@ -171,20 +151,18 @@ def _rows_to_products(rows) -> List[ProductOut]:
         img_path = _image_path_for(code)
         image_url = f"/products/{code}/image" if os.path.exists(img_path) else None
 
-        # We select effective_barcode via SQL alias
-        effective_barcode = r["effective_barcode"]
-
         out.append(
             ProductOut(
                 product_code=code,
                 full_description=r["full_description"],
                 retail_price=float(r["retail_price"]),
                 manufacturers_product_code=r["manufacturers_product_code"],
-                barcode=effective_barcode,
+                barcode=r["barcode"],
                 image_url=image_url,
             )
         )
     return out
+
 
 def _search_products_internal(q: str, mode: str = "smart", limit: int = 25) -> List[ProductOut]:
     q = (q or "").strip()
@@ -197,74 +175,43 @@ def _search_products_internal(q: str, mode: str = "smart", limit: int = 25) -> L
     conn = get_conn()
     cur = conn.cursor()
     try:
-        # Helper base select (effective barcode = override else product)
-        base_select = """
-            SELECT
-              p.*,
-              COALESCE(bo.barcode, p.barcode) AS effective_barcode
-            FROM products p
-            LEFT JOIN barcode_overrides bo ON bo.product_code = p.product_code
-        """
-
         if mode == "smart":
             q_compact = q.replace(" ", "")
             if q_compact.isdigit():
-                # First try alias table (fast + accurate)
-                cur.execute(
-                    """
-                    SELECT p.*, COALESCE(bo.barcode, p.barcode) AS effective_barcode
-                    FROM barcode_aliases ba
-                    JOIN products p ON p.product_code = ba.product_code
-                    LEFT JOIN barcode_overrides bo ON bo.product_code = p.product_code
-                    WHERE ba.barcode = ?
-                    LIMIT ?
-                    """,
-                    (q_compact, limit),
-                )
+                cur.execute("SELECT * FROM products WHERE barcode = ? LIMIT ?", (q_compact, limit))
                 rows = cur.fetchall()
                 if rows:
                     return _rows_to_products(rows)
 
-                # Then try effective barcode match (override or CSV)
-                cur.execute(
-                    base_select + " WHERE COALESCE(bo.barcode, p.barcode) = ? LIMIT ?",
-                    (q_compact, limit),
-                )
+                cur.execute("SELECT * FROM products WHERE product_code = ? LIMIT ?", (q_compact, limit))
                 rows = cur.fetchall()
                 if rows:
                     return _rows_to_products(rows)
 
-                # Then product code exact
-                cur.execute(base_select + " WHERE p.product_code = ? LIMIT ?", (q_compact, limit))
-                rows = cur.fetchall()
-                if rows:
-                    return _rows_to_products(rows)
-
-            # Name search
             cur.execute(
-                base_select
-                + " WHERE LOWER(p.full_description) LIKE LOWER(?) ORDER BY p.full_description LIMIT ?",
+                "SELECT * FROM products WHERE LOWER(full_description) LIKE LOWER(?) "
+                "ORDER BY full_description LIMIT ?",
                 (f"%{q}%", limit),
             )
             return _rows_to_products(cur.fetchall())
 
         if mode == "name":
             cur.execute(
-                base_select
-                + " WHERE LOWER(p.full_description) LIKE LOWER(?) ORDER BY p.full_description LIMIT ?",
+                "SELECT * FROM products WHERE LOWER(full_description) LIKE LOWER(?) "
+                "ORDER BY full_description LIMIT ?",
                 (f"%{q}%", limit),
             )
             return _rows_to_products(cur.fetchall())
 
         if mode == "code":
             cur.execute(
-                base_select
-                + """
-                WHERE p.product_code = ?
-                   OR p.manufacturers_product_code = ?
-                   OR p.product_code LIKE ?
-                   OR p.manufacturers_product_code LIKE ?
-                ORDER BY p.full_description
+                """
+                SELECT * FROM products
+                WHERE product_code = ?
+                   OR manufacturers_product_code = ?
+                   OR product_code LIKE ?
+                   OR manufacturers_product_code LIKE ?
+                ORDER BY full_description
                 LIMIT ?
                 """,
                 (q, q, f"%{q}%", f"%{q}%", limit),
@@ -273,29 +220,11 @@ def _search_products_internal(q: str, mode: str = "smart", limit: int = 25) -> L
 
         if mode == "barcode":
             q_compact = q.replace(" ", "")
-
-            # alias match first
             cur.execute(
                 """
-                SELECT p.*, COALESCE(bo.barcode, p.barcode) AS effective_barcode
-                FROM barcode_aliases ba
-                JOIN products p ON p.product_code = ba.product_code
-                LEFT JOIN barcode_overrides bo ON bo.product_code = p.product_code
-                WHERE ba.barcode = ?
-                LIMIT ?
-                """,
-                (q_compact, limit),
-            )
-            rows = cur.fetchall()
-            if rows:
-                return _rows_to_products(rows)
-
-            # fallback to effective barcode direct match
-            cur.execute(
-                base_select
-                + """
-                WHERE COALESCE(bo.barcode, p.barcode) = ?
-                   OR COALESCE(bo.barcode, p.barcode) LIKE ?
+                SELECT * FROM products
+                WHERE barcode = ?
+                   OR barcode LIKE ?
                 LIMIT ?
                 """,
                 (q_compact, f"%{q_compact}%", limit),
@@ -305,6 +234,7 @@ def _search_products_internal(q: str, mode: str = "smart", limit: int = 25) -> L
         return _search_products_internal(q=q, mode="smart", limit=limit)
     finally:
         conn.close()
+
 
 @app.get("/products/search", response_model=List[ProductOut])
 def search_products(
@@ -317,6 +247,7 @@ def search_products(
     effective_q = (q or "").strip() or (query or "").strip() or (search or "").strip()
     return _search_products_internal(q=effective_q, mode=mode, limit=limit)
 
+
 @app.get("/search", response_model=List[ProductOut])
 def legacy_search(
     q: str = Query("", min_length=0),
@@ -325,75 +256,9 @@ def legacy_search(
 ):
     return _search_products_internal(q=(q or "").strip(), mode=mode, limit=limit)
 
-# -----------------------------
-# ✅ NEW: Barcode update endpoints (NO PIN, as requested)
-# -----------------------------
-@app.put("/products/{product_code}/barcode")
-def set_product_barcode(product_code: str, payload: BarcodeUpdateIn = Body(...)):
-    code = (product_code or "").strip()
-    if not code:
-        raise HTTPException(status_code=400, detail="product_code required")
-
-    new_barcode = _normalize_barcode(payload.barcode)
-
-    conn = get_conn()
-    cur = conn.cursor()
-    try:
-        # Ensure product exists
-        cur.execute("SELECT product_code FROM products WHERE product_code = ? LIMIT 1", (code,))
-        if not cur.fetchone():
-            raise HTTPException(status_code=404, detail="Product not found")
-
-        now = datetime.now().isoformat(timespec="seconds")
-
-        # Upsert override (or clear it)
-        if new_barcode:
-            cur.execute(
-                """
-                INSERT INTO barcode_overrides (product_code, barcode, updated_at)
-                VALUES (?, ?, ?)
-                ON CONFLICT(product_code) DO UPDATE SET
-                    barcode=excluded.barcode,
-                    updated_at=excluded.updated_at
-                """,
-                (code, new_barcode, now),
-            )
-            # Maintain alias mapping for scanning
-            cur.execute(
-                """
-                INSERT INTO barcode_aliases (barcode, product_code, updated_at)
-                VALUES (?, ?, ?)
-                ON CONFLICT(barcode) DO UPDATE SET
-                    product_code=excluded.product_code,
-                    updated_at=excluded.updated_at
-                """,
-                (new_barcode, code, now),
-            )
-        else:
-            cur.execute("DELETE FROM barcode_overrides WHERE product_code = ?", (code,))
-
-        conn.commit()
-        return {"ok": True, "product_code": code, "barcode": new_barcode}
-    finally:
-        conn.close()
-
-@app.delete("/products/{product_code}/barcode")
-def clear_product_barcode_override(product_code: str):
-    code = (product_code or "").strip()
-    if not code:
-        raise HTTPException(status_code=400, detail="product_code required")
-
-    conn = get_conn()
-    cur = conn.cursor()
-    try:
-        cur.execute("DELETE FROM barcode_overrides WHERE product_code = ?", (code,))
-        conn.commit()
-        return {"ok": True, "product_code": code, "cleared": True}
-    finally:
-        conn.close()
 
 # -----------------------------
-# Product Images (unchanged, still PIN protected)
+# Product Images (NO PIN)
 # -----------------------------
 @app.get("/products/{product_code}/image")
 def get_product_image(product_code: str):
@@ -407,7 +272,8 @@ def get_product_image(product_code: str):
 
     return FileResponse(path, media_type="image/jpeg")
 
-@app.post("/products/{product_code}/image", dependencies=[Depends(require_admin_pin)])
+
+@app.post("/products/{product_code}/image")
 async def upload_product_image(product_code: str, file: UploadFile = File(...)):
     code = (product_code or "").strip()
     if not code:
@@ -430,7 +296,8 @@ async def upload_product_image(product_code: str, file: UploadFile = File(...)):
 
     return {"ok": True, "product_code": code, "image_url": f"/products/{code}/image"}
 
-@app.delete("/products/{product_code}/image", dependencies=[Depends(require_admin_pin)])
+
+@app.delete("/products/{product_code}/image")
 def delete_product_image(product_code: str):
     code = (product_code or "").strip()
     if not code:
@@ -446,8 +313,9 @@ def delete_product_image(product_code: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to delete image: {repr(e)}")
 
+
 # -----------------------------
-# Bridge: Process Requests (unchanged)
+# Bridge: Process Requests
 # -----------------------------
 class ProcessItemIn(BaseModel):
     product_code: str
@@ -455,9 +323,11 @@ class ProcessItemIn(BaseModel):
     description: Optional[str] = None
     price: Optional[float] = None
 
+
 class ProcessRequestIn(BaseModel):
     requested_by: Optional[str] = None
     items: List[ProcessItemIn]
+
 
 @app.post("/bridge/process_requests")
 def create_process_request(payload: ProcessRequestIn):
@@ -491,8 +361,9 @@ def create_process_request(payload: ProcessRequestIn):
     finally:
         conn.close()
 
+
 # -----------------------------
-# Reorder Email (unchanged)
+# Reorder Email
 # -----------------------------
 @app.post("/reorder")
 def reorder(payload: dict = Body(...)):
@@ -505,12 +376,36 @@ def reorder(payload: dict = Body(...)):
         or "Unknown"
     )
 
-    raw_lines = payload.get("lines") or payload.get("items") or payload.get("cart") or []
+    if ("product_code" in payload or "productCode" in payload or "code" in payload) and (
+        "qty" in payload or "quantity" in payload or "count" in payload
+    ):
+        raw_lines = [payload]
+    else:
+        raw_lines = (
+            payload.get("lines")
+            or payload.get("items")
+            or payload.get("cart")
+            or payload.get("products")
+            or payload.get("rows")
+            or payload.get("order_items")
+            or payload.get("reorder_items")
+            or payload.get("data")
+        )
+
+        if raw_lines is None:
+            for v in payload.values():
+                if isinstance(v, list):
+                    raw_lines = v
+                    break
+
+        if raw_lines is None:
+            raw_lines = []
+
     if isinstance(raw_lines, dict):
         raw_lines = [raw_lines]
 
     if not isinstance(raw_lines, list) or len(raw_lines) == 0:
-        raise HTTPException(status_code=400, detail="No reorder lines provided")
+        raise HTTPException(status_code=400, detail="No reorder lines provided (expected lines/items/cart array)")
 
     lines_text: List[str] = []
     idx = 1
@@ -520,7 +415,13 @@ def reorder(payload: dict = Body(...)):
             continue
 
         product_code = (line.get("product_code") or line.get("productCode") or line.get("code") or "").strip()
-        qty_val = line.get("qty") or line.get("quantity") or line.get("count")
+
+        qty_val = line.get("qty")
+        if qty_val is None:
+            qty_val = line.get("quantity")
+        if qty_val is None:
+            qty_val = line.get("count")
+
         note = (line.get("note") or line.get("reason") or "").strip() or None
 
         if not product_code:
@@ -539,7 +440,7 @@ def reorder(payload: dict = Body(...)):
         idx += 1
 
     if not lines_text:
-        raise HTTPException(status_code=400, detail="All lines were empty/invalid")
+        raise HTTPException(status_code=400, detail="All lines were empty/invalid (need product_code + qty>0)")
 
     subject = f"Reorder Request - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
     body = (
@@ -553,6 +454,7 @@ def reorder(payload: dict = Body(...)):
         return {"ok": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Reorder email failed: {repr(e)}")
+
 
 @app.post("/admin/reorder")
 def admin_reorder(payload: dict = Body(...)):
