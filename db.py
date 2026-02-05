@@ -1,3 +1,4 @@
+# db.py
 from pathlib import Path
 import sqlite3
 import os
@@ -15,7 +16,7 @@ def init_db() -> None:
     cur = conn.cursor()
 
     # -------------------------
-    # Products (price checker search)
+    # Products (CSV baseline)
     # -------------------------
     cur.execute(
         """
@@ -33,40 +34,30 @@ def init_db() -> None:
     cur.execute("CREATE INDEX IF NOT EXISTS idx_products_mfg_code ON products(manufacturers_product_code);")
 
     # -------------------------
-    # Persistent barcode overrides
-    # barcode -> product_code mapping (survives CSV imports)
+    # Barcode overrides (manual, should survive CSV refreshes)
     # -------------------------
     cur.execute(
         """
-        CREATE TABLE IF NOT EXISTS product_barcodes (
+        CREATE TABLE IF NOT EXISTS barcode_overrides (
+          product_code TEXT PRIMARY KEY,
+          barcode TEXT,
+          updated_at TEXT
+        );
+        """
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_barcode_overrides_barcode ON barcode_overrides(barcode);")
+
+    # Optional: barcode -> product lookup (fast scan)
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS barcode_aliases (
           barcode TEXT PRIMARY KEY,
           product_code TEXT NOT NULL,
-          source TEXT NOT NULL DEFAULT 'manual',
-          updated_at TEXT,
-          updated_by TEXT,
-          FOREIGN KEY(product_code) REFERENCES products(product_code) ON DELETE CASCADE
+          updated_at TEXT
         );
         """
     )
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_product_barcodes_product ON product_barcodes(product_code);")
-
-    # -------------------------
-    # Kerridge Bridge Queue  (unchanged from your file)
-    # -------------------------
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS process_requests (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          created_at TEXT NOT NULL,
-          status TEXT NOT NULL CHECK(status IN ('pending','in_progress','completed','cancelled')),
-          payload_json TEXT NOT NULL,
-          requested_by TEXT,
-          kerridge_order_number TEXT
-        );
-        """
-    )
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_process_requests_status ON process_requests(status);")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_process_requests_created_at ON process_requests(created_at);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_barcode_aliases_product ON barcode_aliases(product_code);")
 
     # -------------------------
     # Stock Take (unchanged)
