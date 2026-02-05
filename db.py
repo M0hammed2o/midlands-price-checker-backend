@@ -33,7 +33,25 @@ def init_db() -> None:
     cur.execute("CREATE INDEX IF NOT EXISTS idx_products_mfg_code ON products(manufacturers_product_code);")
 
     # -------------------------
-    # Kerridge Bridge Queue
+    # Persistent barcode overrides
+    # barcode -> product_code mapping (survives CSV imports)
+    # -------------------------
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS product_barcodes (
+          barcode TEXT PRIMARY KEY,
+          product_code TEXT NOT NULL,
+          source TEXT NOT NULL DEFAULT 'manual',
+          updated_at TEXT,
+          updated_by TEXT,
+          FOREIGN KEY(product_code) REFERENCES products(product_code) ON DELETE CASCADE
+        );
+        """
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_product_barcodes_product ON product_barcodes(product_code);")
+
+    # -------------------------
+    # Kerridge Bridge Queue  (unchanged from your file)
     # -------------------------
     cur.execute(
         """
@@ -51,7 +69,7 @@ def init_db() -> None:
     cur.execute("CREATE INDEX IF NOT EXISTS idx_process_requests_created_at ON process_requests(created_at);")
 
     # -------------------------
-    # Stock Take
+    # Stock Take (unchanged)
     # -------------------------
     cur.execute(
         """
@@ -78,7 +96,6 @@ def init_db() -> None:
         """
     )
 
-    # Bin → Products mapping (drives bin dropdown + baseline)
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS bin_products (
