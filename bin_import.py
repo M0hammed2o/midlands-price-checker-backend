@@ -1,78 +1,136 @@
+# import_csv.py
 import csv
-import io
-from typing import Any, Dict, List
+import re
+from typing import Optional, List, Dict
+from datetime import datetime
 
+from db import get_conn
 
-def parse_bin_locations_csv(content: bytes) -> List[Dict[str, Any]]:
+def _pick(row: dict, *keys: str) -> Optional[str]:
+    for k in keys:
+        v = row.get(k)
+        if v is None:
+            continue
+        s = str(v).strip()
+        if s:
+            return s
+    return None
+
+def _to_float(value: Optional[str]) -> float:
+    if value is None:
+        return 0.0
+    s = str(value).strip()
+    if not s:
+        return 0.0
+    s = s.replace("R", "").replace(",", "").strip()
+    try:
+        return float(s)
+    except Exception:
+        return 0.0
+
+def _read_csv_rows(csv_path: str) -> List[Dict[str, str]]:
+    with open(csv_path, "rb") as f:
+        raw = f.read()
+
+    for enc in ("utf-8-sig", "cp1252", "latin-1"):
+        try:
+            text = raw.decode(enc)
+            break
+        except UnicodeDecodeError:
+            text = None
+    if text is None:
+        text = raw.decode("latin-1", errors="replace")
+
+    reader = csv.DictReader(text.splitlines())
+    return list(reader)
+
+def _normalize_barcode(raw: Optional[str]) -> Optional[str]:
     """
-    Expected columns (case-insensitive):
-      - product_code
-      - description
-      - stock_qty (optional)
-      - main_bin
-      - alt_bins (optional)  e.g. "12,14,90" or "12|14|90"
+    Normalize barcodes from CSV:
+    - removes leading ^ and whitespace
+    - keeps leading zeros
+    - strips non-digits
+    - returns None if empty or all zeros
     """
-    text = content.decode("utf-8", errors="ignore")
-    reader = csv.DictReader(io.StringIO(text))
-
-    # normalize headers
-    fieldnames = [f.strip().lower() for f in (reader.fieldnames or [])]
-    if not fieldnames:
-        return []
-
-    def get(row, *names):
-        for n in names:
-            if n in row:
-                return row.get(n)
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
         return None
 
-    out: List[Dict[str, Any]] = []
+    # Some exports prefix with ^
+    s = s.lstrip("^").strip()
 
-    for raw in reader:
-        row = {k.strip().lower(): (v.strip() if isinstance(v, str) else v) for k, v in raw.items()}
+    # Keep digits only (EAN/UPC)
+    digits = re.sub(r"\D+", "", s)
+    if not digits:
+        return None
 
-        product_code = (get(row, "product_code", "product", "code") or "").strip()
-        description = (get(row, "description", "desc") or "").strip()
-        main_bin = (get(row, "main_bin", "bin", "bin_code") or "").strip()
-        alt_bins = (get(row, "alt_bins", "alts", "alt") or "").strip()
-        qty_raw = (get(row, "stock_qty", "baseline_qty", "qty", "quantity") or "").strip()
+    # Treat "000000..." as not a real barcode
+    if set(digits) == {"0"}:
+        return None
 
-        if not product_code or not main_bin:
-            continue
+    return digits
 
-        baseline_qty = None
-        if qty_raw != "":
-            try:
-                baseline_qty = float(qty_raw)
-            except:
-                baseline_qty = None
+def import_products(csv_path: str) -> int:
+    rows = _read_csv_rows(csv_path)
+    if not rows:
+        return 0
 
-        # main bin record
-        out.append(
-            dict(
-                bin_code=str(main_bin),
-                product_code=str(product_code),
-                description=description,
-                baseline_qty=baseline_qty,
-                is_main=1,
-                alt_index=0,
+    conn = get_conn()
+    cur = conn.cursor()
+    now = datetime.now().isoformat(timespec="seconds")
+
+    inserted_or_updated = 0
+    try:
+        for row in rows:
+            product_code = _pick(row, "product_code", "Product Code", "Code")
+            full_description = _pick(row, "full_description", "Full Description", "Description", "Name")
+            retail_price = _to_float(_pick(row, "retail_price", "Retail Price", "VAT Inclusive Price", "Price"))
+
+            mfg_code = _pick(row, "manufacturers_product_code", "Manufacturers Product Code", "Manufacturer Code")
+
+            # ✅ IMPORTANT: support "Bar Code" (your file), plus other variants
+            barcode_raw = _pick(
+                row,
+                "barcode", "Barcode", "Bar Code", "BarCode", "BAR CODE", "BARCODE",
+                "ScanCode", "scancode", "scan_code", "Scan Code"
             )
-        )
+            barcode = _normalize_barcode(barcode_raw)
 
-        # alt bins (optional)
-        if alt_bins:
-            # allow commas or pipes
-            parts = [p.strip() for p in alt_bins.replace("|", ",").split(",") if p.strip()]
-            for idx, b in enumerate(parts, start=1):
-                out.append(
-                    dict(
-                        bin_code=str(b),
-                        product_code=str(product_code),
-                        description=description,
-                        baseline_qty=baseline_qty,
-                        is_main=0,
-                        alt_index=idx,
-                    )
+            if not product_code or not full_description:
+                continue
+
+            cur.execute(
+                """
+                INSERT INTO products (product_code, full_description, retail_price, manufacturers_product_code, barcode)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(product_code) DO UPDATE SET
+                    full_description=excluded.full_description,
+                    retail_price=excluded.retail_price,
+                    manufacturers_product_code=excluded.manufacturers_product_code,
+                    barcode=excluded.barcode
+                """,
+                (product_code, full_description, float(retail_price), mfg_code, barcode),
+            )
+
+            # Also build barcode -> product map (helps scanning)
+            if barcode:
+                cur.execute(
+                    """
+                    INSERT INTO barcode_aliases (barcode, product_code, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(barcode) DO UPDATE SET
+                        product_code=excluded.product_code,
+                        updated_at=excluded.updated_at
+                    """,
+                    (barcode, product_code, now),
                 )
 
+            inserted_or_updated += 1
+
+        conn.commit()
+        return inserted_or_updated
+    finally:
+        conn.close()
     return out
