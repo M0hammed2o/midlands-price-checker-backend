@@ -42,7 +42,7 @@ app.add_middleware(
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=False,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization"],
+    allow_headers=["Content-Type", "Authorization", "X-Admin-Pin"],  # ✅ add this
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -459,3 +459,4 @@ def reorder(payload: dict = Body(...)):
 @app.post("/admin/reorder")
 def admin_reorder(payload: dict = Body(...)):
     return reorder(payload)
+
