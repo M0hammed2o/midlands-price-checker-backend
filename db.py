@@ -1,14 +1,67 @@
 # db.py
 import os
 import sqlite3
+from typing import Optional
 
 DB_PATH = os.getenv("DB_PATH", "midlands.db")
 DB_URL = f"sqlite:///{DB_PATH}"
 
+
 def get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+
+    # Safer defaults
+    try:
+        conn.execute("PRAGMA foreign_keys = ON;")
+        conn.execute("PRAGMA busy_timeout = 5000;")
+    except Exception:
+        pass
+
     return conn
+
+
+def _has_table(cur: sqlite3.Cursor, table: str) -> bool:
+    cur.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+        (table,),
+    )
+    return cur.fetchone() is not None
+
+
+def _has_column(cur: sqlite3.Cursor, table: str, column: str) -> bool:
+    cur.execute(f"PRAGMA table_info({table})")
+    cols = [row[1] for row in cur.fetchall()]  # row[1] = column name
+    return column in cols
+
+
+def _ensure_products_schema(cur: sqlite3.Cursor) -> None:
+    """
+    Create products table (new installs) and migrate old installs.
+    """
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS products (
+          product_code TEXT PRIMARY KEY,
+          full_description TEXT NOT NULL,
+          retail_price REAL NOT NULL DEFAULT 0,
+          manufacturers_product_code TEXT,
+          barcode TEXT,
+          updated_at TEXT
+        );
+        """
+    )
+
+    # MIGRATION: if products exists but missing updated_at, add it
+    # (This is what fixes: OperationalError('no such column: updated_at'))
+    if _has_table(cur, "products") and not _has_column(cur, "products", "updated_at"):
+        cur.execute("ALTER TABLE products ADD COLUMN updated_at TEXT;")
+
+    # indexes
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_products_desc ON products(full_description);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_products_barcode ON products(barcode);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_products_mfg_code ON products(manufacturers_product_code);")
+
 
 def init_db() -> None:
     conn = get_conn()
@@ -17,20 +70,7 @@ def init_db() -> None:
     # -------------------------
     # Products (CSV baseline)
     # -------------------------
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS products (
-          product_code TEXT PRIMARY KEY,
-          full_description TEXT NOT NULL,
-          retail_price REAL NOT NULL DEFAULT 0,
-          manufacturers_product_code TEXT,
-          barcode TEXT
-        );
-        """
-    )
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_products_desc ON products(full_description);")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_products_barcode ON products(barcode);")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_products_mfg_code ON products(manufacturers_product_code);")
+    _ensure_products_schema(cur)
 
     # -------------------------
     # Barcode overrides (manual, survives CSV refreshes)
