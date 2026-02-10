@@ -14,11 +14,6 @@ from bin_import import parse_bin_locations_csv
 router = APIRouter(prefix="/stocktake", tags=["stocktake"])
 
 
-# -----------------------------
-# Admin PIN protection
-# - Header: X-Admin-Pin
-# - (Export only): query param admin_pin or pin
-# -----------------------------
 def _read_admin_pin_env() -> str:
     return (os.getenv("ADMIN_PIN", "") or "").strip()
 
@@ -36,10 +31,6 @@ def require_admin_pin_header_or_query(
     admin_pin: Optional[str] = Query(default=None),
     pin: Optional[str] = Query(default=None),
 ):
-    """
-    Used for endpoints that might be opened as a direct download link in the browser.
-    Browser can't send custom headers reliably, so we accept ?admin_pin= or ?pin= too.
-    """
     server_pin = _read_admin_pin_env()
     if not server_pin:
         raise HTTPException(status_code=500, detail="ADMIN_PIN is not configured on server")
@@ -159,6 +150,72 @@ def get_bin_products(bin_code: str = Query(...)):
         conn.close()
 
 
+# ✅ NEW: Add/Update one product into a bin (no CSV needed)
+@router.post("/bin_products/add", dependencies=[Depends(require_admin_pin_header)])
+def add_bin_product(payload: dict = Body(...)):
+    bin_code = (payload.get("bin_code") or "").strip()
+    product_code = (payload.get("product_code") or "").strip()
+    description = (payload.get("description") or "").strip()
+    baseline_qty = payload.get("baseline_qty")
+
+    try:
+        baseline_qty = float(baseline_qty if baseline_qty is not None else 0)
+    except Exception:
+        baseline_qty = 0.0
+
+    if not bin_code or not product_code:
+        raise HTTPException(status_code=400, detail="bin_code and product_code required")
+
+    # If no description provided, try pull from products table
+    if not description:
+        conn = get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT full_description FROM products WHERE product_code = ? LIMIT 1", (product_code,))
+            r = cur.fetchone()
+            if r:
+                description = r["full_description"] or ""
+        finally:
+            conn.close()
+
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            INSERT OR REPLACE INTO bin_products
+            (bin_code, product_code, description, baseline_qty, is_main, alt_index)
+            VALUES (?, ?, ?, ?, 1, 0)
+            """,
+            (bin_code, product_code, description, baseline_qty),
+        )
+        conn.commit()
+        return {"ok": True}
+    finally:
+        conn.close()
+
+
+# ✅ NEW: Remove product from bin
+@router.post("/bin_products/remove", dependencies=[Depends(require_admin_pin_header)])
+def remove_bin_product(payload: dict = Body(...)):
+    bin_code = (payload.get("bin_code") or "").strip()
+    product_code = (payload.get("product_code") or "").strip()
+    if not bin_code or not product_code:
+        raise HTTPException(status_code=400, detail="bin_code and product_code required")
+
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "DELETE FROM bin_products WHERE bin_code = ? AND product_code = ?",
+            (bin_code, product_code),
+        )
+        conn.commit()
+        return {"ok": True}
+    finally:
+        conn.close()
+
+
 @router.post("/bins/upload", dependencies=[Depends(require_admin_pin_header)])
 async def upload_bins(file: UploadFile = File(...)):
     filename = (file.filename or "").lower()
@@ -204,33 +261,55 @@ async def upload_bins(file: UploadFile = File(...)):
 
 
 def _resolve_product(barcode: Optional[str], product_code: Optional[str]):
+    """
+    ✅ Best + easiest:
+    1) barcode_aliases (barcode -> product_code)
+    2) products.barcode exact match
+    3) product_code exact match
+    4) numeric barcode might actually be product_code
+    """
     barcode = (barcode or "").strip().replace(" ", "")
     product_code = (product_code or "").strip()
 
     conn = get_conn()
     cur = conn.cursor()
     try:
+        # 1) barcode_aliases first (best for scanning)
+        if barcode:
+            cur.execute(
+                """
+                SELECT p.product_code, p.full_description, p.barcode
+                FROM barcode_aliases a
+                JOIN products p ON p.product_code = a.product_code
+                WHERE a.barcode = ?
+                LIMIT 1
+                """,
+                (barcode,),
+            )
+            r = cur.fetchone()
+            if r:
+                return r["product_code"], r["full_description"], r["barcode"] or barcode
+
+        # 2) fallback: products.barcode direct
         if barcode:
             cur.execute("SELECT * FROM products WHERE barcode = ? LIMIT 1", (barcode,))
             r = cur.fetchone()
             if r:
-                # sqlite3.Row has no .get()
-                rb = r["barcode"] if "barcode" in r.keys() else None
-                return r["product_code"], r["full_description"], rb
+                return r["product_code"], r["full_description"], r["barcode"] or barcode
 
+        # 3) product_code direct
         if product_code:
             cur.execute("SELECT * FROM products WHERE product_code = ? LIMIT 1", (product_code,))
             r = cur.fetchone()
             if r:
-                rb = r["barcode"] if "barcode" in r.keys() else None
-                return r["product_code"], r["full_description"], rb
+                return r["product_code"], r["full_description"], r["barcode"] or None
 
-        if barcode.isdigit():
+        # 4) numeric barcode might be product_code
+        if barcode and barcode.isdigit():
             cur.execute("SELECT * FROM products WHERE product_code = ? LIMIT 1", (barcode,))
             r = cur.fetchone()
             if r:
-                rb = r["barcode"] if "barcode" in r.keys() else None
-                return r["product_code"], r["full_description"], rb
+                return r["product_code"], r["full_description"], r["barcode"] or barcode
 
         return (product_code or barcode or ""), "UNKNOWN", (barcode or None)
     finally:
@@ -280,15 +359,7 @@ def add_or_update_item(payload: dict = Body(...)):
               updated_by=excluded.updated_by,
               updated_at=excluded.updated_at
             """,
-            (
-                session_id,
-                resolved_code,
-                resolved_desc,
-                resolved_barcode,
-                quantity,
-                updated_by,
-                now_iso(),
-            ),
+            (session_id, resolved_code, resolved_desc, resolved_barcode, quantity, updated_by, now_iso()),
         )
 
         conn.commit()
@@ -384,21 +455,10 @@ def move_item(payload: dict = Body(...)):
               updated_by=excluded.updated_by,
               updated_at=excluded.updated_at
             """,
-            (
-                to_session_id,
-                r["product_code"],
-                r["description"],
-                r["barcode"],
-                r["quantity"],
-                r["updated_by"],
-                now_iso(),
-            ),
+            (to_session_id, r["product_code"], r["description"], r["barcode"], r["quantity"], r["updated_by"], now_iso()),
         )
 
-        cur.execute(
-            "DELETE FROM stocktake_items WHERE session_id = ? AND product_code = ?",
-            (from_session_id, product_code),
-        )
+        cur.execute("DELETE FROM stocktake_items WHERE session_id = ? AND product_code = ?", (from_session_id, product_code))
 
         conn.commit()
         return {"ok": True}
@@ -406,9 +466,6 @@ def move_item(payload: dict = Body(...)):
         conn.close()
 
 
-# -----------------------------
-# EXPORTS (allow header OR query pin)
-# -----------------------------
 @router.get("/export", dependencies=[Depends(require_admin_pin_header_or_query)])
 def export_session(session_id: str = Query(...)):
     session_id = (session_id or "").strip()
@@ -430,22 +487,10 @@ def export_session(session_id: str = Query(...)):
         w = csv.writer(output)
         w.writerow(["bin", "product_code", "description", "barcode", "quantity", "updated_by", "updated_at"])
         for r in rows:
-            w.writerow([
-                r["session_id"],
-                r["product_code"],
-                r["description"],
-                r["barcode"] or "",
-                r["quantity"],
-                r["updated_by"] or "",
-                r["updated_at"] or "",
-            ])
+            w.writerow([r["session_id"], r["product_code"], r["description"], r["barcode"] or "", r["quantity"], r["updated_by"] or "", r["updated_at"] or ""])
 
         data = output.getvalue().encode("utf-8")
-        return StreamingResponse(
-            io.BytesIO(data),
-            media_type="text/csv",
-            headers={"Content-Disposition": f'attachment; filename="stocktake_{session_id}.csv"'},
-        )
+        return StreamingResponse(io.BytesIO(data), media_type="text/csv", headers={"Content-Disposition": f'attachment; filename="stocktake_{session_id}.csv"'})
     finally:
         conn.close()
 
@@ -468,22 +513,10 @@ def export_all_bins():
         w = csv.writer(output)
         w.writerow(["bin", "product_code", "description", "barcode", "quantity", "updated_by", "updated_at"])
         for r in rows:
-            w.writerow([
-                r["session_id"],
-                r["product_code"],
-                r["description"],
-                r["barcode"] or "",
-                r["quantity"],
-                r["updated_by"] or "",
-                r["updated_at"] or "",
-            ])
+            w.writerow([r["session_id"], r["product_code"], r["description"], r["barcode"] or "", r["quantity"], r["updated_by"] or "", r["updated_at"] or ""])
 
         data = output.getvalue().encode("utf-8")
-        return StreamingResponse(
-            io.BytesIO(data),
-            media_type="text/csv",
-            headers={"Content-Disposition": 'attachment; filename="stocktake_ALL_bins.csv"'},
-        )
+        return StreamingResponse(io.BytesIO(data), media_type="text/csv", headers={"Content-Disposition": 'attachment; filename="stocktake_ALL_bins.csv"'})
     finally:
         conn.close()
 
@@ -512,10 +545,6 @@ def export_all_merged():
             w.writerow([r["product_code"], r["description"], r["quantity"]])
 
         data = output.getvalue().encode("utf-8")
-        return StreamingResponse(
-            io.BytesIO(data),
-            media_type="text/csv",
-            headers={"Content-Disposition": 'attachment; filename="stocktake_ALL_merged.csv"'},
-        )
+        return StreamingResponse(io.BytesIO(data), media_type="text/csv", headers={"Content-Disposition": 'attachment; filename="stocktake_ALL_merged.csv"'})
     finally:
         conn.close()
