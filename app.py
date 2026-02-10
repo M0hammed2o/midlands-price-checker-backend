@@ -3,16 +3,7 @@ import os
 from datetime import datetime
 from typing import List, Optional
 
-from fastapi import (
-    FastAPI,
-    Query,
-    UploadFile,
-    File,
-    HTTPException,
-    Body,
-    Header,
-    Depends,
-)
+from fastapi import FastAPI, Query, UploadFile, File, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from starlette.responses import FileResponse
@@ -21,16 +12,12 @@ from dotenv import load_dotenv
 from db import init_db, get_conn
 from import_csv import import_products
 from emailer import send_reorder_email
-
 from stocktake import router as stocktake_router, init_stocktake_tables
 
 load_dotenv()
 
 app = FastAPI(title="Midlands Price Checker")
 
-# -----------------------------
-# CORS
-# -----------------------------
 ALLOWED_ORIGINS = [
     "https://midlands-price-checker.pages.dev",
     "http://localhost:5173",
@@ -42,7 +29,7 @@ app.add_middleware(
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=False,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization", "X-Admin-Pin"],  # ✅ add this
+    allow_headers=["Content-Type", "Authorization", "X-Admin-Pin"],
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -54,13 +41,9 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 REPORT_CSV_PATH = os.path.join(DATA_DIR, "ProductScanApp_clean.csv")
 
-# Stocktake routes
 app.include_router(stocktake_router)
 
 
-# -----------------------------
-# Bridge / Process Request tables
-# -----------------------------
 def init_bridge_tables():
     conn = get_conn()
     cur = conn.cursor()
@@ -104,9 +87,6 @@ def health():
     return {"ok": True}
 
 
-# -----------------------------
-# Upload report CSV (NO PIN)
-# -----------------------------
 @app.post("/admin/upload_report")
 async def upload_report(file: UploadFile = File(...)):
     filename = (file.filename or "").lower()
@@ -127,9 +107,6 @@ async def upload_report(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"CSV import failed: {repr(e)}")
 
 
-# -----------------------------
-# Models
-# -----------------------------
 class ProductOut(BaseModel):
     product_code: str
     full_description: str
@@ -177,17 +154,37 @@ def _search_products_internal(q: str, mode: str = "smart", limit: int = 25) -> L
     try:
         if mode == "smart":
             q_compact = q.replace(" ", "")
+
+            # ✅ If digits, treat like scan: alias-first
             if q_compact.isdigit():
+                # 1) barcode_aliases -> products
+                cur.execute(
+                    """
+                    SELECT p.*
+                    FROM barcode_aliases a
+                    JOIN products p ON p.product_code = a.product_code
+                    WHERE a.barcode = ?
+                    LIMIT ?
+                    """,
+                    (q_compact, limit),
+                )
+                rows = cur.fetchall()
+                if rows:
+                    return _rows_to_products(rows)
+
+                # 2) products.barcode exact
                 cur.execute("SELECT * FROM products WHERE barcode = ? LIMIT ?", (q_compact, limit))
                 rows = cur.fetchall()
                 if rows:
                     return _rows_to_products(rows)
 
+                # 3) product_code exact
                 cur.execute("SELECT * FROM products WHERE product_code = ? LIMIT ?", (q_compact, limit))
                 rows = cur.fetchall()
                 if rows:
                     return _rows_to_products(rows)
 
+            # 4) name contains
             cur.execute(
                 "SELECT * FROM products WHERE LOWER(full_description) LIKE LOWER(?) "
                 "ORDER BY full_description LIMIT ?",
@@ -220,11 +217,26 @@ def _search_products_internal(q: str, mode: str = "smart", limit: int = 25) -> L
 
         if mode == "barcode":
             q_compact = q.replace(" ", "")
+
+            # alias-first in barcode mode too
+            cur.execute(
+                """
+                SELECT p.*
+                FROM barcode_aliases a
+                JOIN products p ON p.product_code = a.product_code
+                WHERE a.barcode = ?
+                LIMIT ?
+                """,
+                (q_compact, limit),
+            )
+            rows = cur.fetchall()
+            if rows:
+                return _rows_to_products(rows)
+
             cur.execute(
                 """
                 SELECT * FROM products
-                WHERE barcode = ?
-                   OR barcode LIKE ?
+                WHERE barcode = ? OR barcode LIKE ?
                 LIMIT ?
                 """,
                 (q_compact, f"%{q_compact}%", limit),
@@ -257,9 +269,6 @@ def legacy_search(
     return _search_products_internal(q=(q or "").strip(), mode=mode, limit=limit)
 
 
-# -----------------------------
-# Product Images (NO PIN)
-# -----------------------------
 @app.get("/products/{product_code}/image")
 def get_product_image(product_code: str):
     code = (product_code or "").strip()
@@ -315,55 +324,7 @@ def delete_product_image(product_code: str):
 
 
 # -----------------------------
-# Bridge: Process Requests
-# -----------------------------
-class ProcessItemIn(BaseModel):
-    product_code: str
-    qty: float = Field(..., gt=0)
-    description: Optional[str] = None
-    price: Optional[float] = None
-
-
-class ProcessRequestIn(BaseModel):
-    requested_by: Optional[str] = None
-    items: List[ProcessItemIn]
-
-
-@app.post("/bridge/process_requests")
-def create_process_request(payload: ProcessRequestIn):
-    if not payload.items:
-        raise HTTPException(status_code=400, detail="No items provided")
-
-    conn = get_conn()
-    cur = conn.cursor()
-    try:
-        cur.execute(
-            "INSERT INTO process_requests (created_at, requested_by) VALUES (?, ?)",
-            (datetime.now().isoformat(timespec="seconds"), (payload.requested_by or "").strip() or None),
-        )
-        request_id = cur.lastrowid
-
-        for it in payload.items:
-            code = (it.product_code or "").strip()
-            if not code:
-                continue
-            cur.execute(
-                """
-                INSERT INTO process_request_items
-                (request_id, product_code, qty, description, price)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (request_id, code, float(it.qty), it.description, it.price),
-            )
-
-        conn.commit()
-        return {"ok": True, "id": request_id}
-    finally:
-        conn.close()
-
-
-# -----------------------------
-# Reorder Email
+# Reorder Email (unchanged)
 # -----------------------------
 @app.post("/reorder")
 def reorder(payload: dict = Body(...)):
@@ -459,4 +420,3 @@ def reorder(payload: dict = Body(...)):
 @app.post("/admin/reorder")
 def admin_reorder(payload: dict = Body(...)):
     return reorder(payload)
-
