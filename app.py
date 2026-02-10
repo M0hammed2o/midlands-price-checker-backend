@@ -247,6 +247,44 @@ def _search_products_internal(q: str, mode: str = "smart", limit: int = 25) -> L
     finally:
         conn.close()
 
+# -----------------------------
+# Admin: Upload TWO reports (with + without barcodes)
+# -----------------------------
+@app.post("/admin/upload_reports", dependencies=[Depends(require_admin_pin)])
+async def upload_reports(
+    file_barcodes: UploadFile = File(...),
+    file_nobarcodes: UploadFile = File(...),
+):
+    def _is_csv(f: UploadFile) -> bool:
+        return (f.filename or "").lower().endswith(".csv")
+
+    if not _is_csv(file_barcodes) or not _is_csv(file_nobarcodes):
+        raise HTTPException(status_code=400, detail="Please upload 2 .csv files")
+
+    content_a = await file_barcodes.read()
+    content_b = await file_nobarcodes.read()
+
+    if not content_a or not content_b:
+        raise HTTPException(status_code=400, detail="One of the uploaded files is empty")
+
+    try:
+        barcoded_path = os.path.join(DATA_DIR, "report_with_barcodes.csv")
+        nobar_path = os.path.join(DATA_DIR, "report_without_barcodes.csv")
+
+        with open(barcoded_path, "wb") as f:
+            f.write(content_a)
+        with open(nobar_path, "wb") as f:
+            f.write(content_b)
+
+        from import_csv import import_products_two_reports
+
+        result = import_products_two_reports(
+            csv_with_barcodes=barcoded_path,
+            csv_without_barcodes=nobar_path,
+        )
+        return {"ok": True, **result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"CSV import failed: {repr(e)}")
 
 @app.get("/products/search", response_model=List[ProductOut])
 def search_products(
@@ -420,3 +458,4 @@ def reorder(payload: dict = Body(...)):
 @app.post("/admin/reorder")
 def admin_reorder(payload: dict = Body(...)):
     return reorder(payload)
+
