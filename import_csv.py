@@ -49,7 +49,7 @@ def _detect_headers(fieldnames: List[str]) -> Dict[str, str]:
     Map many possible header spellings to standard keys.
     Returns dict: standard_key -> actual_csv_header
     """
-    fn = [f.strip() for f in (fieldnames or [])]
+    fn = [f.strip() for f in (fieldnames or []) if f is not None]
     lower = {f.lower(): f for f in fn}
 
     def pick(*cands: str) -> Optional[str]:
@@ -130,6 +130,24 @@ def _read_rows(csv_path: str) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
         return rows, mapping
 
 
+# ---------- schema / migrations ----------
+def _ensure_updated_at_column():
+    """
+    Your DB may already have a 'products' table created before updated_at existed.
+    SQLite won't auto-add columns, so we patch it safely.
+    """
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("PRAGMA table_info(products)")
+        cols = [row[1] for row in cur.fetchall()]  # row[1] = column name
+        if "updated_at" not in cols:
+            cur.execute("ALTER TABLE products ADD COLUMN updated_at TEXT")
+            conn.commit()
+    finally:
+        conn.close()
+
+
 def _ensure_schema():
     conn = get_conn()
     cur = conn.cursor()
@@ -151,7 +169,11 @@ def _ensure_schema():
     finally:
         conn.close()
 
+    # patch older databases
+    _ensure_updated_at_column()
 
+
+# ---------- core import ----------
 def _upsert_products(records: List[Dict[str, Any]], prefer_barcode: bool) -> int:
     """
     prefer_barcode=True: barcode in record overwrites existing barcode
@@ -167,7 +189,7 @@ def _upsert_products(records: List[Dict[str, Any]], prefer_barcode: bool) -> int
                 continue
 
             desc = _norm(rec.get("full_description")) or "Unknown product"
-            price = float(rec.get("retail_price") or 0.0)
+            price = float(noteq := (rec.get("retail_price") or 0.0))  # safe cast
             mpc = _norm(rec.get("manufacturers_product_code")) or None
             bc = rec.get("barcode")
 
@@ -180,7 +202,8 @@ def _upsert_products(records: List[Dict[str, Any]], prefer_barcode: bool) -> int
             existing = cur.fetchone()
 
             if existing:
-                existing_barcode = existing["barcode"] if isinstance(existing, dict) else existing[1]
+                # sqlite row can be tuple-like
+                existing_barcode = existing[1]
 
                 new_barcode = existing_barcode
                 if bc:
@@ -200,7 +223,7 @@ def _upsert_products(records: List[Dict[str, Any]], prefer_barcode: bool) -> int
                         updated_at = datetime('now')
                     WHERE product_code = ?
                     """,
-                    (desc, price, mpc, new_barcode, code),
+                    (desc, float(noteq), mpc, new_barcode, code),
                 )
                 changed += 1
             else:
@@ -210,7 +233,7 @@ def _upsert_products(records: List[Dict[str, Any]], prefer_barcode: bool) -> int
                     (product_code, full_description, retail_price, manufacturers_product_code, barcode, updated_at)
                     VALUES (?, ?, ?, ?, ?, datetime('now'))
                     """,
-                    (code, desc, price, mpc, bc if prefer_barcode else (bc or None)),
+                    (code, desc, float(noteq), mpc, bc if prefer_barcode else (bc or None)),
                 )
                 changed += 1
 
@@ -233,17 +256,6 @@ def import_products_two_reports(csv_with_barcodes: str, csv_without_barcodes: st
 
     def to_records(rows: List[Dict[str, Any]], mapping: Dict[str, str], has_barcode: bool) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
-
-        # If CSV has NO headers / mapping is empty, we try positional fallback (common with broken exports)
-        has_headers = bool(mapping.get("product_code") and mapping.get("full_description"))
-
-        if not has_headers:
-            # Try reading as raw rows using csv.reader (positional columns)
-            # expected: product_code, description, price, mpc, barcode(optional)
-            # We'll re-open with safe fallback and parse again.
-            raw_rows, _ = _read_rows(csv_with_barcodes if has_barcode else csv_without_barcodes)  # already dict rows
-            # If still no usable headers, just return empty list
-            return out
 
         for r in rows:
             rec = {
