@@ -1,7 +1,6 @@
 # db.py
-from pathlib import Path
-import sqlite3
 import os
+import sqlite3
 
 DB_PATH = os.getenv("DB_PATH", "midlands.db")
 DB_URL = f"sqlite:///{DB_PATH}"
@@ -34,7 +33,7 @@ def init_db() -> None:
     cur.execute("CREATE INDEX IF NOT EXISTS idx_products_mfg_code ON products(manufacturers_product_code);")
 
     # -------------------------
-    # Barcode overrides (manual, should survive CSV refreshes)
+    # Barcode overrides (manual, survives CSV refreshes)
     # -------------------------
     cur.execute(
         """
@@ -47,7 +46,9 @@ def init_db() -> None:
     )
     cur.execute("CREATE INDEX IF NOT EXISTS idx_barcode_overrides_barcode ON barcode_overrides(barcode);")
 
-    # Optional: barcode -> product lookup (fast scan)
+    # -------------------------
+    # Barcode aliases: barcode -> product_code (BEST for scanning)
+    # -------------------------
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS barcode_aliases (
@@ -60,7 +61,7 @@ def init_db() -> None:
     cur.execute("CREATE INDEX IF NOT EXISTS idx_barcode_aliases_product ON barcode_aliases(product_code);")
 
     # -------------------------
-    # Stock Take (unchanged)
+    # Stock Take
     # -------------------------
     cur.execute(
         """
@@ -87,6 +88,7 @@ def init_db() -> None:
         """
     )
 
+    # Bin expected products (what SHOULD be in a bin)
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS bin_products (
