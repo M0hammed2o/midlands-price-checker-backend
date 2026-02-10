@@ -1,141 +1,227 @@
-# import_csv.py
 import csv
 import re
-from typing import Optional, List, Dict
-from datetime import datetime
+from typing import Dict, Any, List, Optional, Tuple
 
 from db import get_conn
 
+# ---------- helpers ----------
+def _norm(s: Any) -> str:
+    return str(s or "").strip()
 
-def _pick(row: dict, *keys: str) -> Optional[str]:
-    for k in keys:
-        v = row.get(k)
-        if v is None:
-            continue
-        s = str(v).strip()
-        if s:
-            return s
-    return None
-
-
-def _to_float(value: Optional[str]) -> float:
-    if value is None:
-        return 0.0
-    s = str(value).strip()
+def _to_float(x: Any) -> float:
+    s = _norm(x)
     if not s:
         return 0.0
-    s = s.replace("R", "").replace(",", "").strip()
+    # handle "1,234.56"
+    s = s.replace(" ", "").replace(",", "")
     try:
         return float(s)
     except Exception:
         return 0.0
 
-
-def _read_csv_rows(csv_path: str) -> List[Dict[str, str]]:
-    with open(csv_path, "rb") as f:
-        raw = f.read()
-
-    text = None
-    for enc in ("utf-8-sig", "cp1252", "latin-1"):
-        try:
-            text = raw.decode(enc)
-            break
-        except UnicodeDecodeError:
-            continue
-
-    if text is None:
-        text = raw.decode("latin-1", errors="replace")
-
-    reader = csv.DictReader(text.splitlines())
-    return list(reader)
-
-
-def _normalize_barcode(raw: Optional[str]) -> Optional[str]:
+def _clean_barcode(raw: Any) -> Optional[str]:
     """
-    Normalize barcodes from CSV:
-    - removes leading ^ and whitespace
-    - keeps leading zeros
-    - strips non-digits
-    - returns None if empty or all zeros
+    Kerridge barcodes can look like:
+      ^60095 51 80 27 61
+      6009509920844
+      0000000000000 (meaning "no barcode")
+    We normalize to digits-only, return None if unusable.
     """
-    if raw is None:
-        return None
-    s = str(raw).strip()
+    s = _norm(raw)
     if not s:
         return None
-
-    s = s.lstrip("^").strip()
+    s = s.replace("^", "")
     digits = re.sub(r"\D+", "", s)
-
     if not digits:
         return None
     if set(digits) == {"0"}:
         return None
-
+    # sometimes Kerridge includes short/odd codes; keep them if digits exist
     return digits
 
+def _detect_headers(fieldnames: List[str]) -> Dict[str, str]:
+    """
+    Map many possible header spellings to standard keys.
+    Returns dict of standard_key -> actual_csv_header
+    """
+    fn = [f.strip() for f in (fieldnames or [])]
+    lower = {f.lower(): f for f in fn}
 
-def import_products(csv_path: str) -> int:
-    rows = _read_csv_rows(csv_path)
-    if not rows:
-        return 0
+    def pick(*cands: str) -> Optional[str]:
+        for c in cands:
+            if c.lower() in lower:
+                return lower[c.lower()]
+        return None
 
+    mapping = {}
+
+    # barcode header can be "Bar Code" or "BarCode" etc
+    bc = pick("Bar Code", "Barcode", "BarCode", "ScanCode", "Scan Code", "scancode")
+    if bc:
+        mapping["barcode"] = bc
+
+    pc = pick("Product Code", "ProductCode", "Code", "product_code")
+    if pc:
+        mapping["product_code"] = pc
+
+    desc = pick("Full Description", "Description", "full_description", "Name")
+    if desc:
+        mapping["full_description"] = desc
+
+    price = pick("VAT Inclusive Price", "Retail Price", "Price", "vat_inclusive_price", "retail_price")
+    if price:
+        mapping["retail_price"] = price
+
+    mpc = pick("Manufacturers Product Code", "Manufacturer Product Code", "manufacturers_product_code", "MFG Code")
+    if mpc:
+        mapping["manufacturers_product_code"] = mpc
+
+    return mapping
+
+def _read_rows(csv_path: str) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
+    # try utf-8-sig to handle BOM
+    with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        mapping = _detect_headers(reader.fieldnames or [])
+        rows = []
+        for r in reader:
+            rows.append(r)
+        return rows, mapping
+
+def _ensure_schema():
+    """
+    Ensure products table exists and has required columns.
+    """
     conn = get_conn()
     cur = conn.cursor()
-    now = datetime.now().isoformat(timespec="seconds")
-
-    inserted_or_updated = 0
     try:
-        for row in rows:
-            product_code = _pick(row, "product_code", "Product Code", "Code")
-            full_description = _pick(row, "full_description", "Full Description", "Description", "Name")
-            retail_price = _to_float(_pick(row, "retail_price", "Retail Price", "VAT Inclusive Price", "Price"))
-            mfg_code = _pick(row, "manufacturers_product_code", "Manufacturers Product Code", "Manufacturer Code")
-
-            barcode_raw = _pick(
-                row,
-                "barcode", "Barcode", "Bar Code", "BarCode", "BAR CODE", "BARCODE",
-                "ScanCode", "scancode", "scan_code", "Scan Code"
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS products (
+                product_code TEXT PRIMARY KEY,
+                full_description TEXT NOT NULL,
+                retail_price REAL NOT NULL DEFAULT 0,
+                manufacturers_product_code TEXT,
+                barcode TEXT,
+                updated_at TEXT
             )
-            barcode = _normalize_barcode(barcode_raw)
-
-            if not product_code or not full_description:
-                continue
-
-            # Do NOT wipe barcode if CSV barcode is empty
-            cur.execute(
-                """
-                INSERT INTO products (product_code, full_description, retail_price, manufacturers_product_code, barcode)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(product_code) DO UPDATE SET
-                    full_description=excluded.full_description,
-                    retail_price=excluded.retail_price,
-                    manufacturers_product_code=excluded.manufacturers_product_code,
-                    barcode = CASE
-                        WHEN excluded.barcode IS NULL OR TRIM(excluded.barcode) = ''
-                        THEN products.barcode
-                        ELSE excluded.barcode
-                    END
-                """,
-                (product_code, full_description, float(retail_price), mfg_code, barcode),
-            )
-
-            # ✅ Best for scanning: barcode_aliases
-            if barcode:
-                cur.execute(
-                    """
-                    INSERT INTO barcode_aliases (barcode, product_code, updated_at)
-                    VALUES (?, ?, ?)
-                    ON CONFLICT(barcode) DO UPDATE SET
-                        product_code=excluded.product_code,
-                        updated_at=excluded.updated_at
-                    """,
-                    (barcode, product_code, now),
-                )
-
-            inserted_or_updated += 1
-
+            """
+        )
+        # Index barcode for faster scanning lookup
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_products_barcode ON products(barcode)")
         conn.commit()
-        return inserted_or_updated
     finally:
         conn.close()
+
+# ---------- core import ----------
+def _upsert_products(records: List[Dict[str, Any]], prefer_barcode: bool) -> int:
+    """
+    Upsert records into products table.
+    prefer_barcode=True means "if record has barcode, set it; else NEVER overwrite an existing barcode."
+    """
+    conn = get_conn()
+    cur = conn.cursor()
+    changed = 0
+    try:
+        for rec in records:
+            code = _norm(rec.get("product_code"))
+            if not code:
+                continue
+
+            desc = _norm(rec.get("full_description")) or "Unknown product"
+            price = float(rec.get("retail_price") or 0.0)
+            mpc = _norm(rec.get("manufacturers_product_code")) or None
+            bc = rec.get("barcode")  # already cleaned or None
+
+            # skip obvious non-product rows (your sample has "Line Group", "Handling charge")
+            low = (desc or "").lower()
+            if code in ("999998", "999999") or "line group" in low or "handling charge" in low:
+                continue
+
+            # fetch existing
+            cur.execute(
+                "SELECT product_code, barcode FROM products WHERE product_code = ?",
+                (code,),
+            )
+            existing = cur.fetchone()
+
+            if existing:
+                existing_barcode = existing["barcode"] if isinstance(existing, dict) else existing[1]
+
+                # barcode merge rule:
+                # - if prefer_barcode and bc present -> update barcode
+                # - else if not prefer_barcode -> only set barcode if currently empty AND bc present
+                new_barcode = existing_barcode
+                if bc:
+                    if prefer_barcode:
+                        new_barcode = bc
+                    else:
+                        if not existing_barcode:
+                            new_barcode = bc
+
+                cur.execute(
+                    """
+                    UPDATE products
+                    SET full_description = ?,
+                        retail_price = ?,
+                        manufacturers_product_code = ?,
+                        barcode = ?,
+                        updated_at = datetime('now')
+                    WHERE product_code = ?
+                    """,
+                    (desc, price, mpc, new_barcode, code),
+                )
+                changed += 1
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO products
+                    (product_code, full_description, retail_price, manufacturers_product_code, barcode, updated_at)
+                    VALUES (?, ?, ?, ?, ?, datetime('now'))
+                    """,
+                    (code, desc, price, mpc, bc if prefer_barcode else (bc or None)),
+                )
+                changed += 1
+
+        conn.commit()
+        return changed
+    finally:
+        conn.close()
+
+def import_products_two_reports(csv_with_barcodes: str, csv_without_barcodes: str) -> Dict[str, Any]:
+    """
+    Merge strategy:
+      1) Import barcode report first with prefer_barcode=True
+      2) Import no-barcode report second with prefer_barcode=False (never wipes barcode)
+    """
+    _ensure_schema()
+
+    rows_a, map_a = _read_rows(csv_with_barcodes)
+    rows_b, map_b = _read_rows(csv_without_barcodes)
+
+    def to_records(rows: List[Dict[str, Any]], mapping: Dict[str, str], has_barcode: bool) -> List[Dict[str, Any]]:
+        out = []
+        for r in rows:
+            rec = {
+                "product_code": _norm(r.get(mapping.get("product_code", ""), "")),
+                "full_description": _norm(r.get(mapping.get("full_description", ""), "")),
+                "retail_price": _to_float(r.get(mapping.get("retail_price", ""), 0)),
+                "manufacturers_product_code": _norm(r.get(mapping.get("manufacturers_product_code", ""), "")) or None,
+                "barcode": None,
+            }
+            if has_barcode and "barcode" in mapping:
+                rec["barcode"] = _clean_barcode(r.get(mapping["barcode"]))
+            out.append(rec)
+        return out
+
+    rec_a = to_records(rows_a, map_a, has_barcode=True)
+    rec_b = to_records(rows_b, map_b, has_barcode=False)
+
+    changed_a = _upsert_products(rec_a, prefer_barcode=True)
+    changed_b = _upsert_products(rec_b, prefer_barcode=False)
+
+    return {
+        "imported_with_barcodes": changed_a,
+        "imported_without_barcodes": changed_b,
+        "total_changed": changed_a + changed_b,
+    }
