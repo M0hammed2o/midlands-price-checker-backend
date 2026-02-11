@@ -3,12 +3,10 @@ import csv
 import re
 from typing import Dict, Any, List, Optional, Tuple
 
-from db import get_conn
+from db import get_conn, init_db
 
 
-# ---------- helpers ----------
 def _norm(s: Any) -> str:
-    # Kerridge/Excel often includes NBSP (\xa0)
     return str(s or "").replace("\xa0", " ").strip()
 
 
@@ -16,7 +14,6 @@ def _to_float(x: Any) -> float:
     s = _norm(x)
     if not s:
         return 0.0
-    # handle "1,234.56"
     s = s.replace(" ", "").replace(",", "")
     try:
         return float(s)
@@ -25,13 +22,6 @@ def _to_float(x: Any) -> float:
 
 
 def _clean_barcode(raw: Any) -> Optional[str]:
-    """
-    Kerridge barcodes can look like:
-      ^60095 51 80 27 61
-      6009509920844
-      0000000000000 (meaning "no barcode")
-    Normalize to digits-only, return None if unusable.
-    """
     s = _norm(raw)
     if not s:
         return None
@@ -45,11 +35,7 @@ def _clean_barcode(raw: Any) -> Optional[str]:
 
 
 def _detect_headers(fieldnames: List[str]) -> Dict[str, str]:
-    """
-    Map many possible header spellings to standard keys.
-    Returns dict: standard_key -> actual_csv_header
-    """
-    fn = [f.strip() for f in (fieldnames or []) if f is not None]
+    fn = [f.strip() for f in (fieldnames or [])]
     lower = {f.lower(): f for f in fn}
 
     def pick(*cands: str) -> Optional[str]:
@@ -60,7 +46,7 @@ def _detect_headers(fieldnames: List[str]) -> Dict[str, str]:
 
     mapping: Dict[str, str] = {}
 
-    bc = pick("Bar Code", "Barcode", "BarCode", "ScanCode", "Scan Code", "scancode", "EAN", "EAN13", "UPC")
+    bc = pick("Bar Code", "Barcode", "BarCode", "ScanCode", "Scan Code", "EAN", "EAN13", "UPC")
     if bc:
         mapping["barcode"] = bc
 
@@ -97,12 +83,6 @@ def _sniff_dialect(sample: str):
 
 
 def _read_rows(csv_path: str) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
-    """
-    Robust reader:
-    - tries multiple encodings
-    - sniffs delimiter
-    - last fallback uses errors=replace (never crashes)
-    """
     encodings_to_try = ["utf-8-sig", "utf-8", "cp1252", "latin-1"]
 
     last_err = None
@@ -119,7 +99,7 @@ def _read_rows(csv_path: str) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
         except Exception as e:
             last_err = e
 
-    # final fallback: replace bad bytes instead of failing
+    # final fallback: never crash
     with open(csv_path, "r", encoding="utf-8", errors="replace", newline="") as f:
         sample = f.read(8192)
         f.seek(0)
@@ -130,55 +110,7 @@ def _read_rows(csv_path: str) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
         return rows, mapping
 
 
-# ---------- schema / migrations ----------
-def _ensure_updated_at_column():
-    """
-    Your DB may already have a 'products' table created before updated_at existed.
-    SQLite won't auto-add columns, so we patch it safely.
-    """
-    conn = get_conn()
-    cur = conn.cursor()
-    try:
-        cur.execute("PRAGMA table_info(products)")
-        cols = [row[1] for row in cur.fetchall()]  # row[1] = column name
-        if "updated_at" not in cols:
-            cur.execute("ALTER TABLE products ADD COLUMN updated_at TEXT")
-            conn.commit()
-    finally:
-        conn.close()
-
-
-def _ensure_schema():
-    conn = get_conn()
-    cur = conn.cursor()
-    try:
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS products (
-                product_code TEXT PRIMARY KEY,
-                full_description TEXT NOT NULL,
-                retail_price REAL NOT NULL DEFAULT 0,
-                manufacturers_product_code TEXT,
-                barcode TEXT,
-                updated_at TEXT
-            )
-            """
-        )
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_products_barcode ON products(barcode)")
-        conn.commit()
-    finally:
-        conn.close()
-
-    # patch older databases
-    _ensure_updated_at_column()
-
-
-# ---------- core import ----------
 def _upsert_products(records: List[Dict[str, Any]], prefer_barcode: bool) -> int:
-    """
-    prefer_barcode=True: barcode in record overwrites existing barcode
-    prefer_barcode=False: barcode in record only set if existing is empty (never wipes)
-    """
     conn = get_conn()
     cur = conn.cursor()
     changed = 0
@@ -189,7 +121,7 @@ def _upsert_products(records: List[Dict[str, Any]], prefer_barcode: bool) -> int
                 continue
 
             desc = _norm(rec.get("full_description")) or "Unknown product"
-            price = float(noteq := (rec.get("retail_price") or 0.0))  # safe cast
+            price = float(rec.get("retail_price") or 0.0)
             mpc = _norm(rec.get("manufacturers_product_code")) or None
             bc = rec.get("barcode")
 
@@ -202,8 +134,7 @@ def _upsert_products(records: List[Dict[str, Any]], prefer_barcode: bool) -> int
             existing = cur.fetchone()
 
             if existing:
-                # sqlite row can be tuple-like
-                existing_barcode = existing[1]
+                existing_barcode = existing["barcode"]
 
                 new_barcode = existing_barcode
                 if bc:
@@ -223,7 +154,7 @@ def _upsert_products(records: List[Dict[str, Any]], prefer_barcode: bool) -> int
                         updated_at = datetime('now')
                     WHERE product_code = ?
                     """,
-                    (desc, float(noteq), mpc, new_barcode, code),
+                    (desc, price, mpc, new_barcode, code),
                 )
                 changed += 1
             else:
@@ -233,7 +164,7 @@ def _upsert_products(records: List[Dict[str, Any]], prefer_barcode: bool) -> int
                     (product_code, full_description, retail_price, manufacturers_product_code, barcode, updated_at)
                     VALUES (?, ?, ?, ?, ?, datetime('now'))
                     """,
-                    (code, desc, float(noteq), mpc, bc if prefer_barcode else (bc or None)),
+                    (code, desc, price, mpc, bc if prefer_barcode else (bc or None)),
                 )
                 changed += 1
 
@@ -246,16 +177,18 @@ def _upsert_products(records: List[Dict[str, Any]], prefer_barcode: bool) -> int
 def import_products_two_reports(csv_with_barcodes: str, csv_without_barcodes: str) -> Dict[str, Any]:
     """
     Merge strategy:
-      1) Import barcode report first with prefer_barcode=True
-      2) Import no-barcode report second with prefer_barcode=False (never wipes barcode)
+      1) Import barcode report first (prefer_barcode=True)
+      2) Import no-barcode report second (prefer_barcode=False) so it never wipes barcodes
     """
-    _ensure_schema()
+    init_db()
 
     rows_a, map_a = _read_rows(csv_with_barcodes)
     rows_b, map_b = _read_rows(csv_without_barcodes)
 
     def to_records(rows: List[Dict[str, Any]], mapping: Dict[str, str], has_barcode: bool) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
+        if not mapping.get("product_code") or not mapping.get("full_description"):
+            return out
 
         for r in rows:
             rec = {
