@@ -21,8 +21,6 @@ from dotenv import load_dotenv
 from db import init_db, get_conn
 from emailer import send_reorder_email
 from stocktake import router as stocktake_router, init_stocktake_tables
-
-# ✅ from your import_csv.py (two-report merge)
 from import_csv import import_products_two_reports
 
 load_dotenv()
@@ -36,17 +34,10 @@ ADMIN_PIN = (os.getenv("ADMIN_PIN") or "").strip()
 
 
 def require_admin_pin(x_admin_pin: str = Header(default="")):
-    """
-    Protect admin endpoints using a simple PIN header:
-      X-Admin-Pin: <PIN>
-    If ADMIN_PIN is not set, we block admin routes (safe by default).
-    """
     if not ADMIN_PIN:
         raise HTTPException(status_code=500, detail="ADMIN_PIN is not configured on the server")
-
     if (x_admin_pin or "").strip() != ADMIN_PIN:
         raise HTTPException(status_code=401, detail="Invalid admin PIN")
-
     return True
 
 
@@ -64,18 +55,19 @@ app.add_middleware(
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=False,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["*"],  # allow X-Admin-Pin
+    allow_headers=["*"],
 )
 
 # -----------------------------
-# Paths / storage
+# Persistent storage paths
 # -----------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-IMAGES_DIR = os.path.join(BASE_DIR, "product_images")
-os.makedirs(IMAGES_DIR, exist_ok=True)
 
-DATA_DIR = os.path.join(BASE_DIR, "data")
+DATA_DIR = (os.getenv("DATA_DIR") or "").strip() or ("/var/data" if os.path.isdir("/var/data") else os.path.join(BASE_DIR, "data"))
 os.makedirs(DATA_DIR, exist_ok=True)
+
+IMAGES_DIR = (os.getenv("PRODUCT_IMAGES_DIR") or "").strip() or os.path.join(DATA_DIR, "product_images")
+os.makedirs(IMAGES_DIR, exist_ok=True)
 
 # -----------------------------
 # Routers
@@ -173,8 +165,8 @@ def _rows_to_products(rows) -> List[ProductOut]:
                 product_code=code,
                 full_description=r["full_description"],
                 retail_price=float(r["retail_price"]),
-                manufacturers_product_code=r.get("manufacturers_product_code"),
-                barcode=r.get("barcode"),
+                manufacturers_product_code=r["manufacturers_product_code"],
+                barcode=r["barcode"],
                 image_url=image_url,
             )
         )
@@ -226,16 +218,24 @@ def _search_products_internal(q: str, mode: str = "smart", limit: int = 25) -> L
 
             # 4) name contains
             cur.execute(
-                "SELECT * FROM products WHERE LOWER(full_description) LIKE LOWER(?) "
-                "ORDER BY full_description LIMIT ?",
+                """
+                SELECT * FROM products
+                WHERE LOWER(full_description) LIKE LOWER(?)
+                ORDER BY full_description
+                LIMIT ?
+                """,
                 (f"%{q}%", limit),
             )
             return _rows_to_products(cur.fetchall())
 
         if mode == "name":
             cur.execute(
-                "SELECT * FROM products WHERE LOWER(full_description) LIKE LOWER(?) "
-                "ORDER BY full_description LIMIT ?",
+                """
+                SELECT * FROM products
+                WHERE LOWER(full_description) LIKE LOWER(?)
+                ORDER BY full_description
+                LIMIT ?
+                """,
                 (f"%{q}%", limit),
             )
             return _rows_to_products(cur.fetchall())
@@ -257,6 +257,21 @@ def _search_products_internal(q: str, mode: str = "smart", limit: int = 25) -> L
 
         if mode == "barcode":
             q_compact = q.replace(" ", "")
+            # include alias table too
+            cur.execute(
+                """
+                SELECT p.*
+                FROM barcode_aliases a
+                JOIN products p ON p.product_code = a.product_code
+                WHERE a.barcode = ?
+                LIMIT ?
+                """,
+                (q_compact, limit),
+            )
+            rows = cur.fetchall()
+            if rows:
+                return _rows_to_products(rows)
+
             cur.execute(
                 """
                 SELECT * FROM products
@@ -267,7 +282,6 @@ def _search_products_internal(q: str, mode: str = "smart", limit: int = 25) -> L
             )
             return _rows_to_products(cur.fetchall())
 
-        # fallback
         return _search_products_internal(q=q, mode="smart", limit=limit)
     finally:
         conn.close()
@@ -288,7 +302,6 @@ def search_products(
     return _search_products_internal(q=effective_q, mode=mode, limit=limit)
 
 
-# Compatibility: old frontend endpoint
 @app.get("/search", response_model=List[ProductOut])
 def legacy_search(
     q: str = Query("", min_length=0),
@@ -316,9 +329,6 @@ def get_product_image(product_code: str):
 
 @app.post("/products/{product_code}/image", dependencies=[Depends(require_admin_pin)])
 async def upload_product_image(product_code: str, file: UploadFile = File(...)):
-    """
-    Upload an image for a product. Stored as product_images/<product_code>.jpg
-    """
     code = (product_code or "").strip()
     if not code:
         raise HTTPException(status_code=400, detail="product_code required")
@@ -397,7 +407,7 @@ async def upload_reports(
 
 
 # -----------------------------
-# Bridge: Process Requests (basket processing ticket)
+# Bridge: Process Requests
 # -----------------------------
 @app.post("/bridge/process_requests")
 def create_process_request(payload: ProcessRequestIn):
@@ -433,7 +443,7 @@ def create_process_request(payload: ProcessRequestIn):
 
 
 # -----------------------------
-# Reorder Email (simple + reliable)
+# Reorder Email
 # -----------------------------
 @app.post("/reorder")
 def reorder(payload: dict = Body(...)):
@@ -441,8 +451,7 @@ def reorder(payload: dict = Body(...)):
         raise HTTPException(status_code=400, detail="Invalid JSON payload (expected object)")
 
     requested_by = (
-        (payload.get("requested_by") or payload.get("updated_by") or payload.get("user") or "").strip()
-        or "Unknown"
+        (payload.get("requested_by") or payload.get("updated_by") or payload.get("user") or "").strip() or "Unknown"
     )
 
     # Single-item payload support
@@ -461,13 +470,11 @@ def reorder(payload: dict = Body(...)):
             or payload.get("reorder_items")
             or payload.get("data")
         )
-
         if raw_lines is None:
             for v in payload.values():
                 if isinstance(v, list):
                     raw_lines = v
                     break
-
         if raw_lines is None:
             raw_lines = []
 
