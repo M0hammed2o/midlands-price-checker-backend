@@ -199,11 +199,32 @@ def _search_products_internal(q: str, mode: str = "smart", limit: int = 25) -> L
 
             # If digits, treat like scan
             if q_compact.isdigit():
-                # 1) products.barcode exact
-                cur.execute("SELECT * FROM products WHERE barcode = ? LIMIT ?", (q_compact, limit))
-                rows = cur.fetchall()
-                if rows:
-                    return _rows_to_products(rows)
+    # 1) barcode_aliases -> products (best for scanning)
+    cur.execute(
+        """
+        SELECT p.*
+        FROM barcode_aliases a
+        JOIN products p ON p.product_code = a.product_code
+        WHERE a.barcode = ?
+        LIMIT ?
+        """,
+        (q_compact, limit),
+    )
+    rows = cur.fetchall()
+    if rows:
+        return _rows_to_products(rows)
+
+    # 2) products.barcode exact
+    cur.execute("SELECT * FROM products WHERE barcode = ? LIMIT ?", (q_compact, limit))
+    rows = cur.fetchall()
+    if rows:
+        return _rows_to_products(rows)
+
+    # 3) product_code exact
+    cur.execute("SELECT * FROM products WHERE product_code = ? LIMIT ?", (q_compact, limit))
+    rows = cur.fetchall()
+    if rows:
+        return _rows_to_products(rows)
 
                 # 2) product_code exact
                 cur.execute("SELECT * FROM products WHERE product_code = ? LIMIT ?", (q_compact, limit))
@@ -531,3 +552,4 @@ def reorder(payload: dict = Body(...)):
 @app.post("/admin/reorder", dependencies=[Depends(require_admin_pin)])
 def admin_reorder(payload: dict = Body(...)):
     return reorder(payload)
+
