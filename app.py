@@ -171,22 +171,22 @@ def _clean_barcode(raw: str) -> str:
     return digits
 
 
-def _rows_to_products(rows) -> List[ProductOut]:
-    out: List[ProductOut] = []
+def _rows_to_products(rows):
+    out = []
     for r in rows:
-        code = r["product_code"]
-        img_path = _image_path_for(code)
-        image_url = f"/products/{code}/image" if os.path.exists(img_path) else None
+        # sqlite3.Row -> dict so .get() works safely
+        d = dict(r) if not isinstance(r, dict) else r
 
         out.append(
-            ProductOut(
-                product_code=code,
-                full_description=r["full_description"],
-                retail_price=float(r["retail_price"]),
-                manufacturers_product_code=r.get("manufacturers_product_code"),
-                barcode=r.get("effective_barcode") or r.get("barcode"),
-                image_url=image_url,
-            )
+            {
+                "product_code": str(d.get("product_code") or ""),
+                "full_description": d.get("full_description") or d.get("description") or "",
+                "barcode": d.get("barcode") or "",
+                "retail_price": d.get("retail_price") or d.get("price") or 0,
+                "vat_inclusive_price": d.get("vat_inclusive_price") or 0,
+                "manufacturers_product_code": d.get("manufacturers_product_code"),
+                "image_url": d.get("image_url"),
+            }
         )
     return out
 
@@ -725,3 +725,4 @@ def reorder(payload: dict = Body(...)):
 @app.post("/admin/reorder", dependencies=[Depends(require_admin_pin)])
 def admin_reorder(payload: dict = Body(...)):
     return reorder(payload)
+
