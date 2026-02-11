@@ -3,7 +3,7 @@ import csv
 import io
 import os
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Tuple
 
 from fastapi import APIRouter, UploadFile, File, HTTPException, Query, Body, Header, Depends
 from starlette.responses import StreamingResponse
@@ -150,7 +150,7 @@ def get_bin_products(bin_code: str = Query(...)):
         conn.close()
 
 
-# ✅ NEW: Add/Update one product into a bin (no CSV needed)
+# ✅ Add/Update one product into a bin (no CSV needed)
 @router.post("/bin_products/add", dependencies=[Depends(require_admin_pin_header)])
 def add_bin_product(payload: dict = Body(...)):
     bin_code = (payload.get("bin_code") or "").strip()
@@ -195,7 +195,7 @@ def add_bin_product(payload: dict = Body(...)):
         conn.close()
 
 
-# ✅ NEW: Remove product from bin
+# ✅ Remove product from bin
 @router.post("/bin_products/remove", dependencies=[Depends(require_admin_pin_header)])
 def remove_bin_product(payload: dict = Body(...)):
     bin_code = (payload.get("bin_code") or "").strip()
@@ -260,13 +260,15 @@ async def upload_bins(file: UploadFile = File(...)):
         conn.close()
 
 
-def _resolve_product(barcode: Optional[str], product_code: Optional[str]):
+def _resolve_product(barcode: Optional[str], product_code: Optional[str]) -> Tuple[str, str, Optional[str]]:
     """
-    ✅ Best + easiest:
-    1) barcode_aliases (barcode -> product_code)
-    2) products.barcode exact match
-    3) product_code exact match
-    4) numeric barcode might actually be product_code
+    ✅ Correct priority:
+    1) barcode_aliases (barcode -> product_code)  [best for scanning]
+    2) barcode_overrides (product_code override barcode)
+    3) products.barcode exact match (Kerridge)
+    4) product_code exact match
+    5) numeric barcode might actually be product_code
+    Returns: (resolved_code, resolved_desc, resolved_effective_barcode)
     """
     barcode = (barcode or "").strip().replace(" ", "")
     product_code = (product_code or "").strip()
@@ -278,9 +280,13 @@ def _resolve_product(barcode: Optional[str], product_code: Optional[str]):
         if barcode:
             cur.execute(
                 """
-                SELECT p.product_code, p.full_description, p.barcode
+                SELECT
+                    p.product_code,
+                    p.full_description,
+                    COALESCE(o.barcode, p.barcode) AS effective_barcode
                 FROM barcode_aliases a
                 JOIN products p ON p.product_code = a.product_code
+                LEFT JOIN barcode_overrides o ON o.product_code = p.product_code
                 WHERE a.barcode = ?
                 LIMIT 1
                 """,
@@ -288,29 +294,66 @@ def _resolve_product(barcode: Optional[str], product_code: Optional[str]):
             )
             r = cur.fetchone()
             if r:
-                return r["product_code"], r["full_description"], r["barcode"] or barcode
+                return r["product_code"], r["full_description"], r["effective_barcode"] or barcode
 
-        # 2) fallback: products.barcode direct
-        if barcode:
-            cur.execute("SELECT * FROM products WHERE barcode = ? LIMIT 1", (barcode,))
-            r = cur.fetchone()
-            if r:
-                return r["product_code"], r["full_description"], r["barcode"] or barcode
-
-        # 3) product_code direct
+        # 2) if product_code was provided, see if override exists
         if product_code:
-            cur.execute("SELECT * FROM products WHERE product_code = ? LIMIT 1", (product_code,))
+            cur.execute(
+                """
+                SELECT
+                    p.product_code,
+                    p.full_description,
+                    COALESCE(o.barcode, p.barcode) AS effective_barcode
+                FROM products p
+                LEFT JOIN barcode_overrides o ON o.product_code = p.product_code
+                WHERE p.product_code = ?
+                LIMIT 1
+                """,
+                (product_code,),
+            )
             r = cur.fetchone()
             if r:
-                return r["product_code"], r["full_description"], r["barcode"] or None
+                return r["product_code"], r["full_description"], r["effective_barcode"] or None
 
-        # 4) numeric barcode might be product_code
+        # 3) barcode direct match against products.barcode (Kerridge)
+        if barcode:
+            cur.execute(
+                """
+                SELECT
+                    p.product_code,
+                    p.full_description,
+                    COALESCE(o.barcode, p.barcode) AS effective_barcode
+                FROM products p
+                LEFT JOIN barcode_overrides o ON o.product_code = p.product_code
+                WHERE p.barcode = ?
+                LIMIT 1
+                """,
+                (barcode,),
+            )
+            r = cur.fetchone()
+            if r:
+                return r["product_code"], r["full_description"], r["effective_barcode"] or barcode
+
+        # 4) numeric barcode might actually be product_code
         if barcode and barcode.isdigit():
-            cur.execute("SELECT * FROM products WHERE product_code = ? LIMIT 1", (barcode,))
+            cur.execute(
+                """
+                SELECT
+                    p.product_code,
+                    p.full_description,
+                    COALESCE(o.barcode, p.barcode) AS effective_barcode
+                FROM products p
+                LEFT JOIN barcode_overrides o ON o.product_code = p.product_code
+                WHERE p.product_code = ?
+                LIMIT 1
+                """,
+                (barcode,),
+            )
             r = cur.fetchone()
             if r:
-                return r["product_code"], r["full_description"], r["barcode"] or barcode
+                return r["product_code"], r["full_description"], r["effective_barcode"] or barcode
 
+        # fail-safe
         return (product_code or barcode or ""), "UNKNOWN", (barcode or None)
     finally:
         conn.close()
