@@ -1,5 +1,6 @@
 # app.py
 import os
+import re
 from datetime import datetime
 from typing import List, Optional
 
@@ -59,15 +60,17 @@ app.add_middleware(
 )
 
 # -----------------------------
-# Persistent storage paths
+# Paths / storage
 # -----------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# images can stay in repo fs (or you can move to /var/data later if you want persistence)
+IMAGES_DIR = os.path.join(BASE_DIR, "product_images")
+os.makedirs(IMAGES_DIR, exist_ok=True)
+
+# CSV uploads should be in persistent disk if available
 DATA_DIR = (os.getenv("DATA_DIR") or "").strip() or ("/var/data" if os.path.isdir("/var/data") else os.path.join(BASE_DIR, "data"))
 os.makedirs(DATA_DIR, exist_ok=True)
-
-IMAGES_DIR = (os.getenv("PRODUCT_IMAGES_DIR") or "").strip() or os.path.join(DATA_DIR, "product_images")
-os.makedirs(IMAGES_DIR, exist_ok=True)
 
 # -----------------------------
 # Routers
@@ -129,8 +132,14 @@ class ProductOut(BaseModel):
     full_description: str
     retail_price: float
     manufacturers_product_code: Optional[str] = None
-    barcode: Optional[str] = None
+    barcode: Optional[str] = None  # effective barcode (override > product)
     image_url: Optional[str] = None
+
+
+class BarcodeUpdateIn(BaseModel):
+    barcode: str = Field(..., min_length=1)
+    # optional: if true, also update products.barcode (not required)
+    also_update_products_table: bool = False
 
 
 class ProcessItemIn(BaseModel):
@@ -153,6 +162,15 @@ def _image_path_for(code: str) -> str:
     return os.path.join(IMAGES_DIR, f"{safe}.jpg")
 
 
+def _clean_barcode(raw: str) -> str:
+    s = (raw or "").strip()
+    s = s.replace("^", "")
+    digits = re.sub(r"\D+", "", s)
+    if not digits or set(digits) == {"0"}:
+        raise HTTPException(status_code=400, detail="Invalid barcode (must contain digits, not all zeros)")
+    return digits
+
+
 def _rows_to_products(rows) -> List[ProductOut]:
     out: List[ProductOut] = []
     for r in rows:
@@ -165,8 +183,8 @@ def _rows_to_products(rows) -> List[ProductOut]:
                 product_code=code,
                 full_description=r["full_description"],
                 retail_price=float(r["retail_price"]),
-                manufacturers_product_code=r["manufacturers_product_code"],
-                barcode=r["barcode"],
+                manufacturers_product_code=r.get("manufacturers_product_code"),
+                barcode=r.get("effective_barcode") or r.get("barcode"),
                 image_url=image_url,
             )
         )
@@ -187,14 +205,16 @@ def _search_products_internal(q: str, mode: str = "smart", limit: int = 25) -> L
         if mode == "smart":
             q_compact = q.replace(" ", "")
 
-            # If digits, treat like scan
+            # if digits -> try scanning paths first
             if q_compact.isdigit():
-                # 1) barcode_aliases -> products (best for scanning)
+                # 1) barcode_aliases (best for scanning)
                 cur.execute(
                     """
-                    SELECT p.*
+                    SELECT p.*,
+                           COALESCE(o.barcode, p.barcode) AS effective_barcode
                     FROM barcode_aliases a
                     JOIN products p ON p.product_code = a.product_code
+                    LEFT JOIN barcode_overrides o ON o.product_code = p.product_code
                     WHERE a.barcode = ?
                     LIMIT ?
                     """,
@@ -204,24 +224,63 @@ def _search_products_internal(q: str, mode: str = "smart", limit: int = 25) -> L
                 if rows:
                     return _rows_to_products(rows)
 
-                # 2) products.barcode exact
-                cur.execute("SELECT * FROM products WHERE barcode = ? LIMIT ?", (q_compact, limit))
+                # 2) barcode_overrides exact
+                cur.execute(
+                    """
+                    SELECT p.*,
+                           o.barcode AS effective_barcode
+                    FROM barcode_overrides o
+                    JOIN products p ON p.product_code = o.product_code
+                    WHERE o.barcode = ?
+                    LIMIT ?
+                    """,
+                    (q_compact, limit),
+                )
                 rows = cur.fetchall()
                 if rows:
                     return _rows_to_products(rows)
 
-                # 3) product_code exact
-                cur.execute("SELECT * FROM products WHERE product_code = ? LIMIT ?", (q_compact, limit))
+                # 3) products.barcode exact (kerridge)
+                cur.execute(
+                    """
+                    SELECT p.*,
+                           COALESCE(o.barcode, p.barcode) AS effective_barcode
+                    FROM products p
+                    LEFT JOIN barcode_overrides o ON o.product_code = p.product_code
+                    WHERE p.barcode = ?
+                    LIMIT ?
+                    """,
+                    (q_compact, limit),
+                )
                 rows = cur.fetchall()
                 if rows:
                     return _rows_to_products(rows)
 
-            # 4) name contains
+                # 4) product_code exact
+                cur.execute(
+                    """
+                    SELECT p.*,
+                           COALESCE(o.barcode, p.barcode) AS effective_barcode
+                    FROM products p
+                    LEFT JOIN barcode_overrides o ON o.product_code = p.product_code
+                    WHERE p.product_code = ?
+                    LIMIT ?
+                    """,
+                    (q_compact, limit),
+                )
+                rows = cur.fetchall()
+                if rows:
+                    return _rows_to_products(rows)
+
+            # 5) name contains
             cur.execute(
                 """
-                SELECT * FROM products
-                WHERE LOWER(full_description) LIKE LOWER(?)
-                ORDER BY full_description
+                SELECT p.*,
+                       COALESCE(o.barcode, p.barcode) AS effective_barcode
+                FROM products p
+                LEFT JOIN barcode_overrides o ON o.product_code = p.product_code
+                WHERE LOWER(p.full_description) LIKE LOWER(?)
+                ORDER BY p.full_description
                 LIMIT ?
                 """,
                 (f"%{q}%", limit),
@@ -231,9 +290,12 @@ def _search_products_internal(q: str, mode: str = "smart", limit: int = 25) -> L
         if mode == "name":
             cur.execute(
                 """
-                SELECT * FROM products
-                WHERE LOWER(full_description) LIKE LOWER(?)
-                ORDER BY full_description
+                SELECT p.*,
+                       COALESCE(o.barcode, p.barcode) AS effective_barcode
+                FROM products p
+                LEFT JOIN barcode_overrides o ON o.product_code = p.product_code
+                WHERE LOWER(p.full_description) LIKE LOWER(?)
+                ORDER BY p.full_description
                 LIMIT ?
                 """,
                 (f"%{q}%", limit),
@@ -243,12 +305,15 @@ def _search_products_internal(q: str, mode: str = "smart", limit: int = 25) -> L
         if mode == "code":
             cur.execute(
                 """
-                SELECT * FROM products
-                WHERE product_code = ?
-                   OR manufacturers_product_code = ?
-                   OR product_code LIKE ?
-                   OR manufacturers_product_code LIKE ?
-                ORDER BY full_description
+                SELECT p.*,
+                       COALESCE(o.barcode, p.barcode) AS effective_barcode
+                FROM products p
+                LEFT JOIN barcode_overrides o ON o.product_code = p.product_code
+                WHERE p.product_code = ?
+                   OR p.manufacturers_product_code = ?
+                   OR p.product_code LIKE ?
+                   OR p.manufacturers_product_code LIKE ?
+                ORDER BY p.full_description
                 LIMIT ?
                 """,
                 (q, q, f"%{q}%", f"%{q}%", limit),
@@ -257,16 +322,34 @@ def _search_products_internal(q: str, mode: str = "smart", limit: int = 25) -> L
 
         if mode == "barcode":
             q_compact = q.replace(" ", "")
-            # include alias table too
             cur.execute(
                 """
-                SELECT p.*
-                FROM barcode_aliases a
-                JOIN products p ON p.product_code = a.product_code
-                WHERE a.barcode = ?
+                SELECT p.*,
+                       COALESCE(o.barcode, p.barcode) AS effective_barcode
+                FROM products p
+                LEFT JOIN barcode_overrides o ON o.product_code = p.product_code
+                WHERE p.barcode = ?
+                   OR p.barcode LIKE ?
                 LIMIT ?
                 """,
-                (q_compact, limit),
+                (q_compact, f"%{q_compact}%", limit),
+            )
+            rows = cur.fetchall()
+            if rows:
+                return _rows_to_products(rows)
+
+            # also try overrides & aliases in barcode mode
+            cur.execute(
+                """
+                SELECT p.*,
+                       COALESCE(o.barcode, p.barcode) AS effective_barcode
+                FROM barcode_overrides o
+                JOIN products p ON p.product_code = o.product_code
+                WHERE o.barcode = ?
+                   OR o.barcode LIKE ?
+                LIMIT ?
+                """,
+                (q_compact, f"%{q_compact}%", limit),
             )
             rows = cur.fetchall()
             if rows:
@@ -274,8 +357,13 @@ def _search_products_internal(q: str, mode: str = "smart", limit: int = 25) -> L
 
             cur.execute(
                 """
-                SELECT * FROM products
-                WHERE barcode = ? OR barcode LIKE ?
+                SELECT p.*,
+                       COALESCE(o.barcode, p.barcode) AS effective_barcode
+                FROM barcode_aliases a
+                JOIN products p ON p.product_code = a.product_code
+                LEFT JOIN barcode_overrides o ON o.product_code = p.product_code
+                WHERE a.barcode = ?
+                   OR a.barcode LIKE ?
                 LIMIT ?
                 """,
                 (q_compact, f"%{q_compact}%", limit),
@@ -283,6 +371,7 @@ def _search_products_internal(q: str, mode: str = "smart", limit: int = 25) -> L
             return _rows_to_products(cur.fetchall())
 
         return _search_products_internal(q=q, mode="smart", limit=limit)
+
     finally:
         conn.close()
 
@@ -309,6 +398,104 @@ def legacy_search(
     limit: int = Query(25, ge=1, le=100),
 ):
     return _search_products_internal(q=(q or "").strip(), mode=mode, limit=limit)
+
+
+# -----------------------------
+# Admin: barcode override endpoints
+# -----------------------------
+@app.post("/admin/products/{product_code}/barcode", dependencies=[Depends(require_admin_pin)])
+def set_product_barcode(product_code: str, payload: BarcodeUpdateIn):
+    code = (product_code or "").strip()
+    if not code:
+        raise HTTPException(status_code=400, detail="product_code required")
+
+    new_bc = _clean_barcode(payload.barcode)
+
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        # must exist
+        cur.execute("SELECT product_code FROM products WHERE product_code = ?", (code,))
+        if not cur.fetchone():
+            raise HTTPException(status_code=404, detail="Product not found")
+
+        # prevent barcode being assigned to a different product in aliases
+        cur.execute("SELECT product_code FROM barcode_aliases WHERE barcode = ?", (new_bc,))
+        row = cur.fetchone()
+        if row and row["product_code"] != code:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Barcode already assigned to product_code {row['product_code']}. Remove it first.",
+            )
+
+        # 1) upsert override (the source of truth)
+        cur.execute(
+            """
+            INSERT INTO barcode_overrides (product_code, barcode, updated_at)
+            VALUES (?, ?, datetime('now'))
+            ON CONFLICT(product_code) DO UPDATE SET
+                barcode=excluded.barcode,
+                updated_at=datetime('now')
+            """,
+            (code, new_bc),
+        )
+
+        # 2) upsert alias for scanning
+        cur.execute(
+            """
+            INSERT INTO barcode_aliases (barcode, product_code, updated_at)
+            VALUES (?, ?, datetime('now'))
+            ON CONFLICT(barcode) DO UPDATE SET
+                product_code=excluded.product_code,
+                updated_at=datetime('now')
+            """,
+            (new_bc, code),
+        )
+
+        # optional: update products table too (not required, but some people like it)
+        if payload.also_update_products_table:
+            cur.execute(
+                "UPDATE products SET barcode = ?, updated_at = datetime('now') WHERE product_code = ?",
+                (new_bc, code),
+            )
+
+        conn.commit()
+        return {"ok": True, "product_code": code, "barcode": new_bc}
+    finally:
+        conn.close()
+
+
+@app.delete("/admin/products/{product_code}/barcode", dependencies=[Depends(require_admin_pin)])
+def clear_product_barcode_override(product_code: str):
+    code = (product_code or "").strip()
+    if not code:
+        raise HTTPException(status_code=400, detail="product_code required")
+
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        # get current override barcode
+        cur.execute("SELECT barcode FROM barcode_overrides WHERE product_code = ?", (code,))
+        row = cur.fetchone()
+        if not row:
+            return {"ok": True, "deleted": False, "reason": "No override existed"}
+
+        bc = (row["barcode"] or "").strip()
+
+        # delete override
+        cur.execute("DELETE FROM barcode_overrides WHERE product_code = ?", (code,))
+
+        # delete alias only if it points to this product
+        if bc:
+            cur.execute("SELECT product_code FROM barcode_aliases WHERE barcode = ?", (bc,))
+            arow = cur.fetchone()
+            if arow and arow["product_code"] == code:
+                cur.execute("DELETE FROM barcode_aliases WHERE barcode = ?", (bc,))
+
+        conn.commit()
+        return {"ok": True, "deleted": True, "product_code": code}
+    finally:
+        conn.close()
 
 
 # -----------------------------
@@ -369,7 +556,7 @@ def delete_product_image(product_code: str):
 
 
 # -----------------------------
-# Admin: Upload TWO reports (with + without barcodes)
+# Admin: Upload TWO reports
 # -----------------------------
 @app.post("/admin/upload_reports", dependencies=[Depends(require_admin_pin)])
 async def upload_reports(
@@ -451,10 +638,10 @@ def reorder(payload: dict = Body(...)):
         raise HTTPException(status_code=400, detail="Invalid JSON payload (expected object)")
 
     requested_by = (
-        (payload.get("requested_by") or payload.get("updated_by") or payload.get("user") or "").strip() or "Unknown"
+        (payload.get("requested_by") or payload.get("updated_by") or payload.get("user") or "").strip()
+        or "Unknown"
     )
 
-    # Single-item payload support
     if ("product_code" in payload or "productCode" in payload or "code" in payload) and (
         "qty" in payload or "quantity" in payload or "count" in payload
     ):
@@ -470,11 +657,13 @@ def reorder(payload: dict = Body(...)):
             or payload.get("reorder_items")
             or payload.get("data")
         )
+
         if raw_lines is None:
             for v in payload.values():
                 if isinstance(v, list):
                     raw_lines = v
                     break
+
         if raw_lines is None:
             raw_lines = []
 
