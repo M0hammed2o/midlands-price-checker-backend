@@ -1,44 +1,47 @@
 # db.py
 import os
 import sqlite3
-from typing import Optional
+from pathlib import Path
 
-DB_PATH = os.getenv("DB_PATH", "midlands.db")
-DB_URL = f"sqlite:///{DB_PATH}"
+def _default_db_path() -> str:
+    """
+    Prefer env var DB_PATH.
+    If not set, and Render persistent disk mount exists, use /var/data/midlands.db.
+    Otherwise fall back to local midlands.db.
+    """
+    env = (os.getenv("DB_PATH") or "").strip()
+    if env:
+        return env
+
+    # Common Render persistent disk mount (adjust if your mount differs)
+    if os.path.isdir("/var/data"):
+        return "/var/data/midlands.db"
+
+    return "midlands.db"
+
+
+DB_PATH = _default_db_path()
+DB_URL = f"sqlite:///{DB_PATH}"  # not used by sqlite3 directly, but harmless
 
 
 def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    # Ensure parent folder exists (important for /var/data/...)
+    p = Path(DB_PATH)
+    if p.parent and str(p.parent) not in ("", "."):
+        p.parent.mkdir(parents=True, exist_ok=True)
+
+    conn = sqlite3.connect(str(p), check_same_thread=False)
     conn.row_factory = sqlite3.Row
-
-    # Safer defaults
-    try:
-        conn.execute("PRAGMA foreign_keys = ON;")
-        conn.execute("PRAGMA busy_timeout = 5000;")
-    except Exception:
-        pass
-
     return conn
 
 
-def _has_table(cur: sqlite3.Cursor, table: str) -> bool:
-    cur.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
-        (table,),
-    )
-    return cur.fetchone() is not None
+def init_db() -> None:
+    conn = get_conn()
+    cur = conn.cursor()
 
-
-def _has_column(cur: sqlite3.Cursor, table: str, column: str) -> bool:
-    cur.execute(f"PRAGMA table_info({table})")
-    cols = [row[1] for row in cur.fetchall()]  # row[1] = column name
-    return column in cols
-
-
-def _ensure_products_schema(cur: sqlite3.Cursor) -> None:
-    """
-    Create products table (new installs) and migrate old installs.
-    """
+    # -------------------------
+    # Products (CSV baseline)
+    # -------------------------
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS products (
@@ -51,26 +54,9 @@ def _ensure_products_schema(cur: sqlite3.Cursor) -> None:
         );
         """
     )
-
-    # MIGRATION: if products exists but missing updated_at, add it
-    # (This is what fixes: OperationalError('no such column: updated_at'))
-    if _has_table(cur, "products") and not _has_column(cur, "products", "updated_at"):
-        cur.execute("ALTER TABLE products ADD COLUMN updated_at TEXT;")
-
-    # indexes
     cur.execute("CREATE INDEX IF NOT EXISTS idx_products_desc ON products(full_description);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_products_barcode ON products(barcode);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_products_mfg_code ON products(manufacturers_product_code);")
-
-
-def init_db() -> None:
-    conn = get_conn()
-    cur = conn.cursor()
-
-    # -------------------------
-    # Products (CSV baseline)
-    # -------------------------
-    _ensure_products_schema(cur)
 
     # -------------------------
     # Barcode overrides (manual, survives CSV refreshes)
