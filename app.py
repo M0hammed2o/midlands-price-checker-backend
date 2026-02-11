@@ -80,8 +80,6 @@ os.makedirs(DATA_DIR, exist_ok=True)
 # -----------------------------
 # Routers
 # -----------------------------
-# If you want stocktake protected, keep this dependency line.
-# If you want it public, remove dependencies=[...]
 app.include_router(stocktake_router, dependencies=[Depends(require_admin_pin)])
 
 
@@ -199,40 +197,34 @@ def _search_products_internal(q: str, mode: str = "smart", limit: int = 25) -> L
 
             # If digits, treat like scan
             if q_compact.isdigit():
-    # 1) barcode_aliases -> products (best for scanning)
-    cur.execute(
-        """
-        SELECT p.*
-        FROM barcode_aliases a
-        JOIN products p ON p.product_code = a.product_code
-        WHERE a.barcode = ?
-        LIMIT ?
-        """,
-        (q_compact, limit),
-    )
-    rows = cur.fetchall()
-    if rows:
-        return _rows_to_products(rows)
+                # 1) barcode_aliases -> products (best for scanning)
+                cur.execute(
+                    """
+                    SELECT p.*
+                    FROM barcode_aliases a
+                    JOIN products p ON p.product_code = a.product_code
+                    WHERE a.barcode = ?
+                    LIMIT ?
+                    """,
+                    (q_compact, limit),
+                )
+                rows = cur.fetchall()
+                if rows:
+                    return _rows_to_products(rows)
 
-    # 2) products.barcode exact
-    cur.execute("SELECT * FROM products WHERE barcode = ? LIMIT ?", (q_compact, limit))
-    rows = cur.fetchall()
-    if rows:
-        return _rows_to_products(rows)
+                # 2) products.barcode exact
+                cur.execute("SELECT * FROM products WHERE barcode = ? LIMIT ?", (q_compact, limit))
+                rows = cur.fetchall()
+                if rows:
+                    return _rows_to_products(rows)
 
-    # 3) product_code exact
-    cur.execute("SELECT * FROM products WHERE product_code = ? LIMIT ?", (q_compact, limit))
-    rows = cur.fetchall()
-    if rows:
-        return _rows_to_products(rows)
-
-                # 2) product_code exact
+                # 3) product_code exact
                 cur.execute("SELECT * FROM products WHERE product_code = ? LIMIT ?", (q_compact, limit))
                 rows = cur.fetchall()
                 if rows:
                     return _rows_to_products(rows)
 
-            # 3) name contains
+            # 4) name contains
             cur.execute(
                 "SELECT * FROM products WHERE LOWER(full_description) LIKE LOWER(?) "
                 "ORDER BY full_description LIMIT ?",
@@ -275,6 +267,7 @@ def _search_products_internal(q: str, mode: str = "smart", limit: int = 25) -> L
             )
             return _rows_to_products(cur.fetchall())
 
+        # fallback
         return _search_products_internal(q=q, mode="smart", limit=limit)
     finally:
         conn.close()
@@ -331,12 +324,7 @@ async def upload_product_image(product_code: str, file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="product_code required")
 
     filename = (file.filename or "").lower()
-    if not (
-        filename.endswith(".jpg")
-        or filename.endswith(".jpeg")
-        or filename.endswith(".png")
-        or filename.endswith(".webp")
-    ):
+    if not (filename.endswith(".jpg") or filename.endswith(".jpeg") or filename.endswith(".png") or filename.endswith(".webp")):
         raise HTTPException(status_code=400, detail="Upload an image: .jpg/.jpeg/.png/.webp")
 
     data = await file.read()
@@ -410,7 +398,6 @@ async def upload_reports(
 
 # -----------------------------
 # Bridge: Process Requests (basket processing ticket)
-# Frontend calls: POST /bridge/process_requests
 # -----------------------------
 @app.post("/bridge/process_requests")
 def create_process_request(payload: ProcessRequestIn):
@@ -450,15 +437,6 @@ def create_process_request(payload: ProcessRequestIn):
 # -----------------------------
 @app.post("/reorder")
 def reorder(payload: dict = Body(...)):
-    """
-    Accepts flexible payload shapes to avoid 422s.
-
-    Supported examples:
-      1) { "requested_by": "...", "lines": [ {"product_code":"107", "qty":5, "note":"..."} ] }
-      2) { "requested_by": "...", "items": [ {"product_code":"107", "quantity":5} ] }
-      3) { "updated_by": "...", "cart": [ {"code":"107", "qty":5} ] }
-      4) { "product_code":"107", "qty":5 }   # single item
-    """
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Invalid JSON payload (expected object)")
 
@@ -548,8 +526,6 @@ def reorder(payload: dict = Body(...)):
         raise HTTPException(status_code=500, detail=f"Reorder email failed: {repr(e)}")
 
 
-# Compatibility alias for old admin endpoint
 @app.post("/admin/reorder", dependencies=[Depends(require_admin_pin)])
 def admin_reorder(payload: dict = Body(...)):
     return reorder(payload)
-
